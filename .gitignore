@@ -1,0 +1,17 @@
+# model downloads and converted GGUFs
+/models/
+
+# build outputs
+/build/
+/inz
+/tests/test_chat
+/tests/test_chat_parse
+/tests/test_quant
+/tests/test_tokenizer
+/tools/bench_q38
+/tools/cachesim
+/tools/hwprobe
+__pycache__/
+
+# local editor / agent settings
+/.claude/

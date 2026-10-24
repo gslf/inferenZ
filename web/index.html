@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inferenZ</title>
+<style>
+:root {
+  --bg: #ffffff; --bg2: #f6f7f8; --bg3: #eceef1; --fg: #1d2127; --fg2: #5b6270; --line: #e3e6ea;
+  --acc: #16a37b; --acc2: #0f7a5c; --warn: #d9822b; --bad: #d64545; --code: #f3f4f6; --shadow: 0 1px 3px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171b; --bg2: #1b1e23; --bg3: #23272e; --fg: #e6e8eb; --fg2: #9aa1ad; --line: #2c3139;
+    --acc: #2cc79a; --acc2: #22a07c; --code: #1f2329; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171b; --bg2: #1b1e23; --bg3: #23272e; --fg: #e6e8eb; --fg2: #9aa1ad; --line: #2c3139;
+  --acc: #2cc79a; --acc2: #22a07c; --code: #1f2329; --shadow: none;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 15px/1.55 -apple-system, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif; }
+button { font: inherit; cursor: pointer; }
+#app { display: flex; height: 100vh; }
+aside { width: 270px; flex: none; background: var(--bg2); border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 18px 18px 12px; font-weight: 700; font-size: 20px; letter-spacing: -.3px; }
+.brand svg { width: 26px; height: 26px; }
+.newchat { margin: 6px 14px 10px; padding: 11px; border: 0; border-radius: 10px; background: var(--acc); color: #fff; font-weight: 600; }
+.newchat:hover { background: var(--acc2); }
+.convs { flex: 1; overflow-y: auto; padding: 4px 8px; }
+.conv { padding: 8px 10px; border-radius: 8px; color: var(--fg2); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; justify-content: space-between; gap: 6px; }
+.conv:hover, .conv.active { background: var(--bg3); color: var(--fg); }
+.conv .del { visibility: hidden; border: 0; background: none; color: var(--fg2); padding: 0 2px; }
+.conv:hover .del { visibility: visible; }
+.navs { border-top: 1px solid var(--line); padding: 8px; }
+.nav { display: flex; align-items: center; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 8px; background: none; color: var(--fg); text-align: left; }
+.nav:hover, .nav.active { background: var(--bg3); }
+.modelcard { margin: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); font-size: 13px; }
+.modelcard b { display: block; font-size: 14px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--fg2); margin-right: 6px; }
+.dot.ok { background: var(--acc); } .dot.busy { background: var(--warn); }
+main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+header { height: 56px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 0 22px; border-bottom: 1px solid var(--line); }
+header .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+header .live { color: var(--fg2); font-size: 13px; font-variant-numeric: tabular-nums; }
+#chat { flex: 1; overflow-y: auto; }
+.thread { max-width: 820px; margin: 0 auto; padding: 24px 22px 40px; }
+.msg { margin: 18px 0; }
+.msg.user .bubble { margin-left: auto; max-width: 85%; background: var(--bg3); padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; width: fit-content; }
+.msg.ai .bubble { padding: 2px 2px; }
+.think { border-left: 3px solid var(--line); margin: 4px 0 10px; padding: 2px 12px; color: var(--fg2); font-size: 14px; }
+.think summary { cursor: pointer; user-select: none; }
+.think .tbody { white-space: pre-wrap; margin-top: 6px; }
+.stats { color: var(--fg2); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.bubble pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font-size: 13px; }
+.bubble code { font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.bubble :not(pre) > code { background: var(--code); padding: 1px 5px; border-radius: 5px; }
+.bubble p { margin: 8px 0; } .bubble h1, .bubble h2, .bubble h3 { margin: 14px 0 6px; line-height: 1.3; }
+.bubble table { border-collapse: collapse; } .bubble td, .bubble th { border: 1px solid var(--line); padding: 4px 8px; }
+.toolcall { font-family: ui-monospace, monospace; font-size: 13px; background: var(--code); border-radius: 8px; padding: 8px 10px; margin: 6px 0; }
+.empty { text-align: center; color: var(--fg2); margin-top: 18vh; }
+.empty h2 { color: var(--fg); font-size: 26px; margin-bottom: 6px; }
+.composer { flex: none; padding: 10px 22px 18px; }
+.box { max-width: 820px; margin: 0 auto; border: 1px solid var(--line); border-radius: 16px; background: var(--bg); box-shadow: var(--shadow); padding: 10px 12px 8px; }
+.box textarea { width: 100%; border: 0; outline: 0; resize: none; background: transparent; color: var(--fg); font: inherit; max-height: 220px; min-height: 26px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
+.row select { border: 1px solid var(--line); background: var(--bg2); color: var(--fg); border-radius: 8px; padding: 4px 8px; font-size: 13px; }
+.send { border: 0; border-radius: 10px; padding: 7px 16px; background: var(--acc); color: #fff; font-weight: 600; }
+.send.stop { background: var(--bad); }
+.send:disabled { opacity: .5; cursor: default; }
+/* monitor */
+#monitor { flex: 1; overflow-y: auto; display: none; }
+.mon { max-width: 1100px; margin: 0 auto; padding: 22px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.card { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--bg); }
+.card .k { color: var(--fg2); font-size: 13px; }
+.card .v { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.card .s { color: var(--fg2); font-size: 12px; }
+.card canvas { width: 100%; height: 38px; margin-top: 4px; }
+.sec { margin: 26px 0 10px; font-weight: 650; }
+table.st { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.st th { text-align: left; color: var(--fg2); font-weight: 500; border-bottom: 1px solid var(--line); padding: 6px 8px; }
+table.st td { border-bottom: 1px solid var(--line); padding: 5px 8px; }
+.bar { height: 8px; border-radius: 4px; background: var(--acc); }
+.barbg { background: var(--bg3); border-radius: 4px; width: 140px; }
+.heat { display: grid; grid-template-columns: repeat(60, 1fr); gap: 2px; }
+.heat div { height: 46px; border-radius: 2px; display: flex; flex-direction: column-reverse; overflow: hidden; background: var(--bg3); }
+.heat i { display: block; }
+.legend { display: flex; gap: 14px; color: var(--fg2); font-size: 12px; margin: 6px 0; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; background: var(--c); vertical-align: -1px; }
+.btn { border: 1px solid var(--line); background: var(--bg2); color: var(--fg); border-radius: 8px; padding: 6px 12px; font-size: 13px; }
+@media (max-width: 760px) {
+  aside { display: none; }
+  .thread, .mon { padding: 16px; }
+  .composer { padding: 8px 16px 14px; }
+  header { padding: 0 16px; }
+  .heat { grid-template-columns: repeat(30, 1fr); }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside>
+    <div class="brand">
+      <svg viewBox="0 0 32 32" fill="none"><rect x="3" y="3" width="26" height="26" rx="7" fill="var(--acc)"/><path d="M10 11h12L10 21h12" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      inferenZ
+    </div>
+    <button class="newchat" id="newchat">+ New chat</button>
+    <div class="convs" id="convs"></div>
+    <div class="navs">
+      <button class="nav active" id="navchat">💬 Chat</button>
+      <button class="nav" id="navmon">📈 Monitor</button>
+    </div>
+    <div class="modelcard"><b id="mname">Qwen3.8-Flash-Next</b><span class="dot" id="mdot"></span><span id="mstat">connecting…</span></div>
+  </aside>
+  <main>
+    <header><div class="title" id="title">New chat</div><div class="live" id="live"></div></header>
+    <div id="chat"><div class="thread" id="thread"></div></div>
+    <div class="composer" id="composer">
+      <div class="box">
+        <textarea id="input" rows="1" placeholder="Message inferenZ…"></textarea>
+        <div class="row">
+          <div>
+            <select id="effort" title="Reasoning effort">
+              <option value="high">Thinking: high</option><option value="medium">Thinking: medium</option>
+              <option value="low">Thinking: low</option><option value="none">Thinking: off</option>
+            </select>
+            <select id="temp" title="Sampling">
+              <option value="1.0">Temp 1.0 (default)</option><option value="0.7">Temp 0.7</option><option value="0">Greedy</option>
+            </select>
+          </div>
+          <button class="send" id="send">Send</button>
+        </div>
+      </div>
+    </div>
+    <div id="monitor"><div class="mon" id="mon"></div></div>
+  </main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const store = {
+  load() { try { return JSON.parse(localStorage.getItem("inz.convs") || "[]"); } catch { return []; } },
+  save(c) { try { localStorage.setItem("inz.convs", JSON.stringify(c.slice(0, 100))); } catch {} },
+};
+let convs = store.load(), cur = null, busy = false, ctrl = null;
+
+function esc(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function md(src) {
+  const blocks = [];
+  src = src.replace(/```([\w+-]*)\n?([\s\S]*?)(```|$)/g, (_, lang, code) => { blocks.push(`<pre><code>${esc(code)}</code></pre>`); return `\u0000${blocks.length - 1}\u0000`; });
+  let h = esc(src);
+  h = h.replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/^### (.*)$/gm, "<h3>$1</h3>").replace(/^## (.*)$/gm, "<h2>$1</h2>").replace(/^# (.*)$/gm, "<h1>$1</h1>")
+    .replace(/^(?:[-*] .*(?:\n|$))+/gm, (m) => "<ul>" + m.trim().split("\n").map((l) => "<li>" + l.slice(2) + "</li>").join("") + "</ul>")
+    .replace(/^(?:\d+\. .*(?:\n|$))+/gm, (m) => "<ol>" + m.trim().split("\n").map((l) => "<li>" + l.replace(/^\d+\. /, "") + "</li>").join("") + "</ol>")
+    .replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br>");
+  h = "<p>" + h + "</p>";
+  return h.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
+}
+
+function renderConvs() {
+  const el = $("convs"); el.innerHTML = "";
+  for (const c of convs) {
+    const d = document.createElement("div");
+    d.className = "conv" + (cur && c.id === cur.id ? " active" : "");
+    d.innerHTML = `<span>${esc(c.title || "New chat")}</span><button class="del" title="Delete">✕</button>`;
+    d.onclick = (e) => { if (e.target.classList.contains("del")) { convs = convs.filter((x) => x.id !== c.id); store.save(convs); if (cur && cur.id === c.id) newChat(); else renderConvs(); return; } open(c); };
+    el.appendChild(d);
+  }
+}
+function newChat() { cur = { id: Date.now().toString(36), title: "", messages: [] }; renderThread(); renderConvs(); showChat(); $("input").focus(); }
+function open(c) { cur = c; renderThread(); renderConvs(); showChat(); }
+
+function msgEl(m) {
+  const d = document.createElement("div");
+  d.className = "msg " + (m.role === "user" ? "user" : "ai");
+  if (m.role === "user") { d.innerHTML = `<div class="bubble"></div>`; d.firstChild.textContent = m.content; return d; }
+  let h = "";
+  if (m.reasoning) h += `<details class="think"${m.thinking ? " open" : ""}><summary>${m.thinking ? "Thinking…" : "Thought for " + (m.think_s || 0).toFixed(1) + " s"}</summary><div class="tbody"></div></details>`;
+  h += `<div class="bubble">${md(m.content || "")}</div>`;
+  if (m.tool_calls) for (const t of m.tool_calls) h += `<div class="toolcall">⚙ ${esc(t.function.name)}(${esc(t.function.arguments)})</div>`;
+  if (m.stats) h += `<div class="stats">${esc(m.stats)}</div>`;
+  d.innerHTML = h;
+  if (m.reasoning) d.querySelector(".tbody").textContent = m.reasoning;
+  return d;
+}
+function renderThread() {
+  const t = $("thread"); t.innerHTML = "";
+  $("title").textContent = cur.title || "New chat";
+  if (!cur.messages.length) { t.innerHTML = `<div class="empty"><h2>What can I help with?</h2><div>Qwen3.8-Flash-Next, running on this machine.</div></div>`; return; }
+  for (const m of cur.messages) t.appendChild(msgEl(m));
+  $("chat").scrollTop = $("chat").scrollHeight;
+}
+
+function apiMessages() {
+  return cur.messages.map((m) => m.role === "user" ? { role: "user", content: m.content }
+    : { role: "assistant", content: m.content, reasoning_content: m.reasoning || undefined, tool_calls: m.tool_calls });
+}
+
+async function send() {
+  if (busy) { ctrl && ctrl.abort(); return; }
+  const text = $("input").value.trim(); if (!text) return;
+  $("input").value = ""; autosize();
+  if (!cur.messages.length) { cur.title = text.slice(0, 60); convs.unshift(cur); }
+  cur.messages.push({ role: "user", content: text });
+  const ai = { role: "assistant", content: "", reasoning: "", thinking: false };
+  cur.messages.push(ai); renderThread(); renderConvs();
+  busy = true; $("send").textContent = "Stop"; $("send").classList.add("stop");
+  ctrl = new AbortController();
+  const body = { model: $("mname").textContent, stream: true, stream_options: { include_usage: true }, messages: apiMessages().slice(0, -1),
+    temperature: parseFloat($("temp").value), top_p: 0.95, top_k: 20, reasoning_effort: $("effort").value };
+  const t0 = performance.now(); let tThinkStart = 0, ntok = 0;
+  const node = () => $("thread").lastChild;
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal });
+    if (!r.ok) throw new Error(await r.text());
+    const rd = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!ev.startsWith("data: ")) continue;
+        const data = ev.slice(6); if (data === "[DONE]") continue;
+        const j = JSON.parse(data);
+        if (j.timings) ai.timings = j.timings;
+        const ch = j.choices && j.choices[0]; if (!ch) continue;
+        const dl = ch.delta || {};
+        if (dl.reasoning_content) { if (!tThinkStart) tThinkStart = performance.now(); ai.thinking = true; ai.reasoning += dl.reasoning_content; ntok++; }
+        if (dl.content) { if (ai.thinking) { ai.thinking = false; ai.think_s = (performance.now() - tThinkStart) / 1000; } ai.content += dl.content; ntok++; }
+        if (dl.tool_calls) ai.tool_calls = dl.tool_calls;
+        const n = msgEl(ai); $("thread").replaceChild(n, node());
+        const c = $("chat"); if (c.scrollHeight - c.scrollTop - c.clientHeight < 160) c.scrollTop = c.scrollHeight;
+      }
+    }
+  } catch (e) { if (e.name !== "AbortError") ai.content += `\n\n**Error:** ${e.message}`; }
+  if (ai.thinking) { ai.thinking = false; ai.think_s = (performance.now() - tThinkStart) / 1000; }
+  const tm = ai.timings;
+  ai.stats = tm ? `${tm.predicted_n} tokens · ${tm.predicted_per_second.toFixed(2)} tok/s · prompt ${tm.prompt_n} (${tm.prompt_cached || 0} cached) at ${tm.prompt_per_second.toFixed(1)} tok/s · first token ${(tm.ttft_ms / 1000).toFixed(1)} s`
+               : `${ntok} chunks · ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+  $("thread").replaceChild(msgEl(ai), node());
+  busy = false; $("send").textContent = "Send"; $("send").classList.remove("stop");
+  store.save(convs);
+}
+
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 220) + "px"; }
+$("input").addEventListener("input", autosize);
+$("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("send").onclick = send;
+$("newchat").onclick = newChat;
+
+/* ---------------- monitor ---------------- */
+const hist = { tps: [], hit: [], ssd: [] };
+function spark(id, arr, color) {
+  const c = $(id); if (!c) return; const w = c.width = c.clientWidth * devicePixelRatio, h = c.height = c.clientHeight * devicePixelRatio;
+  const g = c.getContext("2d"); g.clearRect(0, 0, w, h); if (arr.length < 2) return;
+  const mx = Math.max(1e-9, ...arr); g.strokeStyle = color; g.lineWidth = 2 * devicePixelRatio; g.beginPath();
+  arr.forEach((v, i) => { const x = i / (arr.length - 1) * w, y = h - v / mx * (h - 4) - 2; i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
+}
+function card(k, v, s, canvas) { return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s || ""}</div>${canvas ? `<canvas id="${canvas}"></canvas>` : ""}</div>`; }
+const f1 = (x) => (x || 0).toFixed(1), f2 = (x) => (x || 0).toFixed(2), pct = (x) => ((x || 0) * 100).toFixed(1) + "%";
+let lastSsd = null;
+async function poll() {
+  let d;
+  try { d = await (await fetch("/v1/diag")).json(); } catch { $("mdot").className = "dot"; $("mstat").textContent = "offline"; return; }
+  $("mdot").className = "dot " + (d.state === "idle" ? "ok" : "busy");
+  $("mstat").textContent = d.state + " · " + f2(d.diag.decode_tps_8) + " tok/s";
+  $("live").textContent = d.state !== "idle" ? `${f2(d.diag.decode_tps_8)} tok/s · cache hit ${pct(d.cache && d.cache.hit_rate_recent)}` : "";
+  if ($("monitor").style.display !== "block") return;
+  const c = d.cache || {}, m = d.memory || {}, g = d.diag;
+  const ssdRate = lastSsd !== null && c.bytes_read !== undefined ? (c.bytes_read - lastSsd) / 1e6 : 0; lastSsd = c.bytes_read;
+  hist.tps.push(g.decode_tps_8); hist.hit.push(c.hit_rate_recent || 0); hist.ssd.push(Math.max(0, ssdRate));
+  for (const k in hist) if (hist[k].length > 120) hist[k].shift();
+  let h = `<div class="cards">`;
+  h += card("Decode", f2(g.decode_tps_8) + " tok/s", `64-token avg ${f2(g.decode_tps_64)} · prefill ${f1(g.prefill_tps_last)} tok/s`, "sp1");
+  h += card("Expert cache hit rate", pct(c.hit_rate_recent), `${c.resident || 0} / ${c.slots || 0} experts resident · lifetime ${pct(c.hit_rate)}`, "sp2");
+  h += card("SSD reads", f1(ssdRate) + " MB/s", `peak ${f1(g.peak_ssd_gbs)} GB/s · avg latency ${f1(c.read_lat_avg_us)} µs · stalled ${f1(c.stall_s)} s`, "sp3");
+  h += card("Memory", f1(m.rss_gb) + " GB RSS", `cache ${f1(m.cache_gb)} GB · dense ${f1(m.dense_gb)} GB · KV ${f2(m.kv_gb)} GB · free ${f1(m.available_gb)} GB`);
+  h += card("Speculative (MTP)", g.verify_steps ? f2(g.tokens_accepted / g.verify_steps + 1) + " tok/step" : "off", `drafted ${g.tokens_drafted} · accepted ${g.tokens_accepted}`);
+  h += card("Router lookahead", pct(g.lookahead.precision) + " precise", `recall ${pct(g.lookahead.recall)} of selected experts were prefetched`);
+  h += card("Recurrent state", f2(m.recurrent_state_gb) + " GB", `DeltaNet states of 36 layers · checkpoint at token ${d.checkpoint}`);
+  const rc = Object.fromEntries((d.recipe || "").split(" ").filter((x) => x.includes("=")).map((x) => x.split("=")));
+  h += card("Recipe", `${esc(rc.experts || "?")} experts`, esc(`dense ${rc.dense} · hyper-conn. ${rc.hc} · head ${rc.head}${rc.screen && rc.screen !== "none" ? " + " + rc.screen + " screen" : ""} · ${d.head && d.head.two_stage ? "two-stage head" : "exact head"}`));
+  h += card("RAM bandwidth", f1(g.peak_ram_gbs) + " GB/s", `measured at startup · ${d.threads || "?"} threads · ${esc(d.isa || "")}`);
+  h += `</div>`;
+  for (const ph of ["decode", "verify", "draft", "prefill"]) {
+    const P = g.phases && g.phases[ph]; if (!P) continue;
+    h += `<div class="sec">${ph[0].toUpperCase() + ph.slice(1)}: where the time goes (${P.tokens} tokens, ${f1(P.seconds)} s; roofline = achieved GB/s ÷ measured peak ${f1(g.peak_ram_gbs)} GB/s)</div><table class="st"><tr><th>Stage</th><th>Share</th><th></th><th>ms/token</th><th>Calls</th><th>RAM GB</th><th>SSD GB</th><th>GB/s</th><th>Roofline</th><th>GFLOP/s</th></tr>`;
+    for (const s of P.stages.sort((a, b) => b.share - a.share))
+      h += `<tr><td>${s.name}</td><td>${pct(s.share)}</td><td><div class="barbg"><div class="bar" style="width:${(s.share * 100).toFixed(1)}%"></div></div></td><td>${f2(s.ms_per_token)}</td><td>${s.calls}</td><td>${f2(s.gb)}</td><td>${f2(s.ssd_gb)}</td><td>${f1(s.gbs)}</td><td>${pct(s.roofline)}</td><td>${f1(s.gflops)}</td></tr>`;
+    h += `</table>`;
+  }
+  h += `<div class="sec">Per layer</div><div class="legend"><span style="--c:var(--acc)">attention</span><span style="--c:#4c8bf5">experts</span><span style="--c:var(--bad)">SSD wait</span><span style="--c:var(--fg2)">other</span></div><div class="heat">`;
+  const L = g.layers || []; const mx = Math.max(1e-9, ...L.map((l) => l.attn + l.experts + l.wait + l.other));
+  for (const l of L) {
+    const t = l.attn + l.experts + l.wait + l.other;
+    h += `<div title="attn ${f2(l.attn)}s experts ${f2(l.experts)}s wait ${f2(l.wait)}s overlap ${pct(l.adj_overlap)}">` +
+      `<i style="height:${l.other / mx * 100}%;background:var(--fg2)"></i><i style="height:${l.attn / mx * 100}%;background:var(--acc)"></i>` +
+      `<i style="height:${l.experts / mx * 100}%;background:#4c8bf5"></i><i style="height:${l.wait / mx * 100}%;background:var(--bad)"></i></div>`;
+  }
+  h += `</div>`;
+  h += `<div class="sec">Tools</div><button class="btn" onclick="armTrace()">Record a Perfetto trace of the next 16 tokens</button> <a class="btn" href="/v1/diag/trace" download="inferenz-trace.json">Download last trace</a> <a class="btn" href="/metrics" target="_blank">Prometheus metrics</a> <a class="btn" href="/v1/diag" target="_blank">Raw JSON</a>`;
+  $("mon").innerHTML = h;
+  spark("sp1", hist.tps, "#16a37b"); spark("sp2", hist.hit, "#4c8bf5"); spark("sp3", hist.ssd, "#d9822b");
+}
+async function armTrace() { await fetch("/v1/diag/trace?tokens=16", { method: "POST" }); }
+function showChat() { $("chat").style.display = ""; $("composer").style.display = ""; $("monitor").style.display = "none"; $("navchat").classList.add("active"); $("navmon").classList.remove("active"); $("title").textContent = cur.title || "New chat"; }
+function showMon() { $("chat").style.display = "none"; $("composer").style.display = "none"; $("monitor").style.display = "block"; $("navmon").classList.add("active"); $("navchat").classList.remove("active"); $("title").textContent = "Monitor"; poll(); }
+$("navchat").onclick = showChat; $("navmon").onclick = showMon;
+fetch("/v1/models").then((r) => r.json()).then((j) => { if (j.data && j.data[0]) $("mname").textContent = j.data[0].id; }).catch(() => {});
+
+setInterval(poll, 1000); poll();
+newChat();
+</script>
+</body>
+</html>
