@@ -22,12 +22,32 @@ static const char web_index[] = {
 typedef struct {
     inz_engine *eng;
     pthread_mutex_t mu;
+    pthread_mutex_t diag_mu;
+    char *diag_json, *metrics;
+    double diag_time;
     const char *api_key;
     char model_id[64];
     volatile int stop;
 } srv;
 
 static srv g_srv;
+
+static void publish_diag(bool force) {
+    if (!g_srv.eng) return;
+    double now = inz_now();
+    if (!force && now - g_srv.diag_time < 0.5) return;
+    jw w;
+    jw_init(&w);
+    engine_diag_json(g_srv.eng, &w);
+    char *metrics = diag_prometheus();
+    pthread_mutex_lock(&g_srv.diag_mu);
+    free(g_srv.diag_json);
+    free(g_srv.metrics);
+    g_srv.diag_json = w.buf;
+    g_srv.metrics = metrics;
+    pthread_mutex_unlock(&g_srv.diag_mu);
+    g_srv.diag_time = now;
+}
 
 static void send_error(http_conn *c, int status, const char *msg) {
     jw w;
@@ -118,7 +138,39 @@ static void sse_chunk(gen_ctx *g, const char *reasoning, size_t nr, const char *
     jw_free(&w);
 }
 
+static void content_delta(gen_ctx *g, bool final, const char **delta, size_t *n) {
+    char *text = g->chat ? g->cp.content : g->text;
+    size_t *len = g->chat ? &g->cp.content_len : &g->text_len;
+    size_t end = *len;
+    for (int i = 0; i < g->n_stops && text; i++) {
+        const char *stop = g->stops[i];
+        if (!*stop) continue;
+        const char *hit = strstr(text + g->emitted_content, stop);
+        if (hit && (size_t)(hit - text) < end) end = (size_t)(hit - text);
+    }
+    if (end < *len) {
+        *len = end;
+        text[end] = 0;
+        g->stopped_by_string = true;
+    } else if (!final) {
+        for (int i = 0; i < g->n_stops; i++) {
+            size_t k = strlen(g->stops[i]);
+            if (!k) continue;
+            k--;
+            if (k > *len - g->emitted_content) k = *len - g->emitted_content;
+            for (; k; k--) if (!memcmp(text + *len - k, g->stops[i], k)) {
+                if (*len - k < end) end = *len - k;
+                break;
+            }
+        }
+    }
+    *delta = text ? text + g->emitted_content : "";
+    *n = end - g->emitted_content;
+    g->emitted_content = end;
+}
+
 static bool on_token(void *ud, int token) {
+    publish_diag(false);
     gen_ctx *g = ud;
     g->ntok++;
     char buf[1024];
@@ -128,40 +180,14 @@ static bool on_token(void *ud, int token) {
         const char *dr, *dc;
         size_t nr, nc;
         chat_parser_feed(&g->cp, buf, n, &dr, &nr, &dc, &nc);
-        // stop strings apply to visible content
-        if (g->n_stops && g->cp.content_len) {
-            for (int i = 0; i < g->n_stops; i++) {
-                const char *hit = strstr(g->cp.content, g->stops[i]);
-                if (hit) {
-                    size_t keep = (size_t)(hit - g->cp.content);
-                    if (keep < g->emitted_content) keep = g->emitted_content;
-                    nc = keep - g->emitted_content;
-                    dc = g->cp.content + g->emitted_content;
-                    g->cp.content_len = keep;
-                    g->cp.content[keep] = 0;
-                    g->stopped_by_string = true;
-                    break;
-                }
-            }
-        }
-        g->emitted_content += nc;
+        content_delta(g, false, &dc, &nc);
         if (g->stream && (nr || nc)) sse_chunk(g, dr, nr, dc, nc, NULL, NULL);
     } else {
         append(&g->text, &g->text_len, &g->text_cap, buf, n);
-        size_t emit = n;
-        for (int i = 0; i < g->n_stops; i++) {
-            const char *hit = strstr(g->text, g->stops[i]);
-            if (hit) {
-                size_t keep = (size_t)(hit - g->text);
-                size_t before = g->text_len - n;
-                emit = keep > before ? keep - before : 0;
-                g->text_len = keep;
-                g->text[keep] = 0;
-                g->stopped_by_string = true;
-                break;
-            }
-        }
-        if (g->stream && emit) sse_chunk(g, NULL, 0, g->text + g->text_len - emit, emit, NULL, NULL);
+        const char *dc;
+        size_t nc;
+        content_delta(g, false, &dc, &nc);
+        if (g->stream && nc) sse_chunk(g, NULL, 0, dc, nc, NULL, NULL);
     }
     if (g->stream && !http_conn_alive(g->c)) g->client_gone = true;
     return !g->client_gone && !g->stopped_by_string;
@@ -296,17 +322,19 @@ static void handle_completion(http_req *r, http_conn *c, bool chat) {
     memset(&res, 0, sizeof(res));
     pthread_mutex_lock(&g_srv.mu);
     int rc = engine_generate(g_srv.eng, ids, n, &go, on_token, &g, &res);
+    publish_diag(true);
     pthread_mutex_unlock(&g_srv.mu);
     free(ids);
 
-    const char *finish = g.stopped_by_string ? "stop" : res.finish_reason ? res.finish_reason : "stop";
     char *tool_calls = NULL;
     const char *dr = "", *dc = "";
     size_t nr = 0, nc = 0;
-    if (chat) {
+    if (chat && !g.stopped_by_string) {
         tool_calls = chat_parser_finish(&g.cp, &dr, &nr, &dc, &nc);
-        if (tool_calls) finish = "tool_calls";
     }
+    content_delta(&g, true, &dc, &nc);
+    if (g.stopped_by_string) { free(tool_calls); tool_calls = NULL; }
+    const char *finish = g.stopped_by_string ? "stop" : tool_calls ? "tool_calls" : res.finish_reason ? res.finish_reason : "stop";
     if (rc != 0 && !g.client_gone) {
         if (g.stream) http_sse_data(c, "{\"error\":{\"message\":\"generation failed\"}}");
         else send_error(c, 500, "generation failed");
@@ -403,15 +431,17 @@ static void handle(http_req *r, http_conn *c, void *ud) {
         return;
     }
     if (get && !strcmp(r->path, "/v1/diag")) {
-        jw w;
-        jw_init(&w);
-        engine_diag_json(g_srv.eng, &w);
-        http_send_json(c, 200, w.buf);
-        jw_free(&w);
+        pthread_mutex_lock(&g_srv.diag_mu);
+        char *p = inz_strdup(g_srv.diag_json);
+        pthread_mutex_unlock(&g_srv.diag_mu);
+        http_send_json(c, 200, p);
+        free(p);
         return;
     }
     if (get && !strcmp(r->path, "/metrics")) {
-        char *p = diag_prometheus();
+        pthread_mutex_lock(&g_srv.diag_mu);
+        char *p = inz_strdup(g_srv.metrics);
+        pthread_mutex_unlock(&g_srv.diag_mu);
         http_send(c, 200, "text/plain; version=0.0.4", p, strlen(p));
         free(p);
         return;
@@ -464,6 +494,8 @@ int server_run(inz_engine *e, const char *host, int port, const char *api_key) {
     g_srv.eng = e;
     g_srv.api_key = api_key;
     pthread_mutex_init(&g_srv.mu, NULL);
+    pthread_mutex_init(&g_srv.diag_mu, NULL);
+    publish_diag(true);
     snprintf(g_srv.model_id, sizeof(g_srv.model_id), "%s", engine_model_name(e));
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);

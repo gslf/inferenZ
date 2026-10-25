@@ -2,7 +2,7 @@
 
 [README](../README.md)
 
-inferenZ keeps its diagnostics on in production. They are exposed through:
+inferenZ keeps its diagnostics on in production. The server publishes a consistent snapshot between generated tokens and at the end of a request. During prefill, the monitor retains the last snapshot. They are exposed through:
 - the web **Monitor** page;
 - `GET /v1/diag` (JSON);
 - `GET /metrics` (Prometheus);
@@ -12,13 +12,13 @@ inferenZ keeps its diagnostics on in production. They are exposed through:
 ## What is measured
 
 ### Per stage, per phase
-Every stage of the forward pass (embedding, hyper-connection mixing, DeltaNet or QSA attention, router, prefetch, resident experts, expert misses, shared expert, n-gram embedding, LM head, sampling, MTP drafting) records:
+The main stages record:
 - TSC cycles;
 - bytes streamed from RAM;
 - bytes read from SSD;
 - FLOPs.
 
-Counters are kept separately for each **phase**: prefill, decode, speculative verify and draft. Decode and prefill have opposite bottlenecks, so mixing them hides both.
+Draft work and waiting for disk reads are measured separately, without counting their time twice. Expert read bytes are attributed to the layer that issues them, including reads anticipated for the next layer. Counters are kept separately for each **phase**: prefill, decode, speculative verify and draft. Decode and prefill have opposite bottlenecks, so mixing them hides both.
 
 For each (phase, stage) the snapshot reports:
 

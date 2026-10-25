@@ -1,6 +1,6 @@
 # Quantization
 
-[README](../README.md) · [Bottlenecks](BOTTLENECKS.md)
+[README](../README.md)
 
 
 To produce each token, the model reads gigabytes of weights from RAM, and on a laptop the speed of memory is the limit. Storing each weight in fewer bits means fewer bytes to read per token, faster generation, a smaller file, and more experts that fit in RAM.
@@ -26,7 +26,7 @@ Weights are stored in groups of 64. In the quantized formats, each group shares 
 
 **Learned levels.** A 4-bit weight can take 16 values. Instead of spacing them evenly, the converter chooses them for each tensor, to fit how its weights are actually distributed: more levels where weights are frequent, fewer at the extremes.
 
-**Importance.** Not all inputs matter equally. The engine can run the model on a sample text and record how strongly each input is used; the converter then spends more precision where it matters (an *importance matrix*).
+**Importance.** Not all inputs matter equally. The engine can run the model on a sample text and record how strongly each input is used; the converter then spends more precision where it matters (an *importance matrix*). This adds no work during generation. An experimental 8-bit scale refinement was removed after it worsened answers: see the [comparison](ANALISI-2026-10-25.md).
 
 ## Why decoding is cheap
 
@@ -39,7 +39,7 @@ To pick each token, the model scores all 248,320 tokens of its vocabulary, which
 2. the tokens whose rough score is close to the best one, about 240 of them, are recomputed exactly from the full-precision weights;
 3. the other tokens keep their rough score, slightly lowered so that, together, they do not get more probability than they should.
 
-The tokens that can actually be chosen are always scored exactly. Measured on the full model, the two stages change the predictions by a KL of 0.003, much less than the rest of the recipe.
+This remains an approximation: the rough scores can miss a candidate. Selection is bounded and always keeps the best rough scores when too many qualify. `--exact-head` scores the whole vocabulary directly, at a higher cost.
 
 ## Prompts use a different kernel
 
@@ -51,4 +51,4 @@ The measurements on the full model (see the [README](../README.md#get-the-model-
 - **4-bit experts** cost little;
 - **4-bit dense weights cost much more**, above all the attention projections, which are the most sensitive weights of the model.
 
-The recommended recipe therefore keeps every dense weight at 8 bits and stores the experts at 4 bits: a 124 GB file, KL 0.014 against the official model, and the same top prediction 96.8% of the time.
+The recommended recipe therefore keeps every dense weight at 8 bits and stores the experts at 4 bits: a 124 GB file. This recipe measured KL 0.014 against the official model and matched its top prediction 96.8% of the time.

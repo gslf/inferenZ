@@ -366,7 +366,6 @@ static void setup_experts(inz_engine *e, uint64_t other_bytes) {
         const uint64_t cap = ram > reserve + rss + other_bytes ? ram - reserve - rss - other_bytes : 0;
         const uint64_t now = avail > other_bytes + (2ull << 30) ? avail - other_bytes - (2ull << 30) : 0;
         budget = cap < now ? cap : now;
-        if (budget < 2ull * Q_N_EXPERT * e->blob_bytes) budget = 2ull * Q_N_EXPERT * e->blob_bytes;
     }
     const bool all = budget >= total;
     e->ec_all_resident = all;
@@ -443,7 +442,7 @@ static void state_alloc(inz_engine *e) {
     e->Xm = inz_aligned(64, sizeof(float) * (size_t)Q_MAX_T * Q_HCW);
     e->ck_pos = -1;
     e->hist = inz_malloc(sizeof(int32_t) * ctx);
-    e->state_bytes = 2 * (S_FLOATS + CONV_FLOATS + PLE_FLOATS) * 4 + (size_t)N_ATT * ctx * (2 * Q_KV * 2 + Q_IDX_HD * 4 + Q_IDX_HD);
+    e->state_bytes = (2 + Q_SPEC_MAX) * (S_FLOATS + CONV_FLOATS + PLE_FLOATS) * 4 + (size_t)N_ATT * ctx * (2 * Q_KV * 2 + Q_IDX_HD * 4 + Q_IDX_HD);
 }
 
 static void state_free(inz_engine *e) {
@@ -705,7 +704,6 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
         // MTP slots P - m .. P - 1 now have their next tokens (the last one is tok); the last row drafts d0,
         // chained MTP steps on the MTP's own residual draft d1, d2
         if (use_mtp(e) && e->mtp_valid == P - m) {
-            const uint64_t tdr = diag_tsc();
             int32_t nxt[Q_SPEC_MAX + 1];
             for (int i = 0; i < m - 1; i++) nxt[i] = e->hist[P - m + 1 + i];
             nxt[m - 1] = tok;
@@ -713,7 +711,8 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
             q_mtp_forward(e, e->X, Q_HCW, nxt, m, P - m, &lr, k > 0, qlog);
             e->mtp_valid = P;
             for (int i = 0; i < k; i++) {
-                if (i > 0) q_mtp_forward(e, e->X2, Q_HCW, &vt[i], 1, P - 1 + i, &r0, 1, qlog + (size_t)i * Q_VOCAB);
+                if (i > 0) q_mtp_forward(e, e->X2 + (size_t)(i == 1 ? m - 1 : 0) * Q_HCW,
+                                         Q_HCW, &vt[i], 1, P - 1 + i, &r0, 1, qlog + (size_t)i * Q_VOCAB);
                 memcpy(e->hist + P, vt, sizeof(int32_t) * (size_t)(i + 1));  // penalties see the drafted prefix
                 const int hn = P + i + 1 > 256 ? 256 : P + i + 1;
                 const int *ix;
@@ -727,7 +726,6 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
                 for (int j = 0; j < c; j++) { acc += pr[j]; if (r < acc) { d = ix[j]; break; } }
                 vt[i + 1] = d;
             }
-            diag_add(DG_DRAFT, -1, tdr, 0, 0);
         } else {
             if (use_mtp(e) && e->mtp_valid >= 0) {
                 LOGI("MTP cache out of step (%d filled, %d expected): speculative decoding off", e->mtp_valid, P - m);

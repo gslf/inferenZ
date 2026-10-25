@@ -25,9 +25,14 @@ build/tokenizer.o: src/unicode_tables.inc
 tools/hwprobe: tools/hwprobe.c
 	$(CC) -O3 $(ARCH) -pthread -o $@ $< -luring
 
-test: inz tests/test_quant tests/test_tokenizer tests/test_chat tests/test_chat_parse
+test: inz tests/test_quant tests/test_tokenizer tests/test_chat tests/test_chat_parse tests/test_forward tests/test_kernels tests/test_kernels_avx2 tests/test_threadpool
 	./tests/test_quant 1024 2048
 	./tests/test_chat_parse
+	./tests/test_forward
+	./tests/test_kernels
+	./tests/test_kernels_avx2
+	./tests/test_threadpool
+	python3 tests/test_regressions.py
 	python3 tests/code_eval.py --selftest
 
 tests/test_chat: tests/test_chat.c src/chat.c src/json.c src/util.c
@@ -39,10 +44,22 @@ tests/test_chat_parse: tests/test_chat_parse.c src/chat.c src/json.c src/util.c
 tests/test_quant: tests/test_quant.c src/quant.c src/util.c
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+tests/test_kernels: tests/test_kernels.c src/quant.c src/util.c
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+tests/test_kernels_avx2: tests/test_kernels.c src/quant.c src/util.c
+	$(CC) $(CFLAGS) -mno-avxvnni -mno-avx512vnni -o $@ $^ -lm
+
+tests/test_threadpool: tests/test_threadpool.c src/threadpool.c
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+
+tests/test_forward: tests/test_forward.c src/model_fwd.c src/quant.c src/threadpool.c src/util.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ tests/test_forward.c src/quant.c src/threadpool.c src/util.c -lm -lpthread
+
 tests/test_tokenizer: tests/test_tokenizer.c src/tokenizer.c src/json.c src/util.c
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 clean:
-	rm -rf build inz tests/test_quant tests/test_tokenizer tests/test_chat tests/test_chat_parse tools/hwprobe
+	rm -rf build inz tests/test_quant tests/test_tokenizer tests/test_chat tests/test_chat_parse tests/test_forward tests/test_kernels tests/test_kernels_avx2 tests/test_threadpool tools/hwprobe
 
 .PHONY: all test clean

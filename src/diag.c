@@ -84,7 +84,8 @@ void diag_add(diag_stage s, int layer, uint64_t t0, uint64_t bytes, uint64_t flo
 
 void diag_add_ssd(diag_stage s, int layer, uint64_t bytes) {
     g_diag.stage[g_diag.phase][s].ssd_bytes += bytes;
-    if (layer >= 0 && layer < DIAG_MAX_LAYERS) g_diag.layer[layer][s].ssd_bytes += bytes;
+    if (layer >= 0 && layer < DIAG_MAX_LAYERS && (g_diag.phase == PH_DECODE || g_diag.phase == PH_VERIFY))
+        g_diag.layer[layer][s].ssd_bytes += bytes;
 }
 
 void diag_token_emitted(void) {
@@ -143,15 +144,10 @@ static uint64_t g_trace_t0;
 static pthread_mutex_t g_trace_mu = PTHREAD_MUTEX_INITIALIZER;
 static char *g_trace_last;
 static size_t g_trace_last_len;
+static atomic_int g_trace_pending;
 
 void trace_arm(int n_tokens) {
-    pthread_mutex_lock(&g_trace_mu);
-    if (!g_trace) g_trace = inz_malloc(sizeof(tev) * TRACE_CAP);
-    atomic_store(&g_trace_n, 0);
-    g_trace_tokens_left = n_tokens > 0 ? n_tokens : 8;
-    g_trace_t0 = __rdtsc();
-    g_trace_on = true;
-    pthread_mutex_unlock(&g_trace_mu);
+    atomic_store(&g_trace_pending, n_tokens > 0 ? n_tokens : 8);
 }
 
 bool trace_active(void) { return g_trace_on; }
@@ -200,6 +196,15 @@ static void trace_finish(void) {
 }
 
 void trace_token_boundary(void) {
+    int pending = atomic_exchange(&g_trace_pending, 0);
+    if (pending) {
+        if (!g_trace) g_trace = inz_malloc(sizeof(tev) * TRACE_CAP);
+        atomic_store(&g_trace_n, 0);
+        g_trace_tokens_left = pending;
+        g_trace_t0 = __rdtsc();
+        g_trace_on = true;
+        return;
+    }
     if (!g_trace_on) return;
     if (--g_trace_tokens_left <= 0) {
         g_trace_on = false;

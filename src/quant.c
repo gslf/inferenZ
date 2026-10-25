@@ -484,10 +484,16 @@ double inz_quantize(const float *W, int rows, int cols, const inz_quant_params *
                     int q = (int)lrintf(x[j] * inv);
                     q = q < -127 ? -127 : q > 127 ? 127 : q;
                     ix[j] = (uint8_t)(q + 128);
-                    float e = x[j] - d * (float)q;
-                    total_err += w[j] * e * e;
                     total_energy += w[j] * x[j] * x[j];
                 }
+                float stored = inz_f16_to_f32(inz_f32_to_f16(d));
+                double best = 0;
+                for (int j = 0; j < INZ_GROUP; j++) {
+                    float decoded = stored * ((int)ix[j] - 128);
+                    double diff = (double)x[j] - decoded;
+                    best += w[j] * diff * diff;
+                }
+                total_err += best;
                 d_all[(size_t)r * ng + g] = d;
             }
         }
@@ -837,7 +843,8 @@ static void mv_q8g(const inz_qmat *m, const inz_act *a, float *y, int r0, int r1
             __m256i s0 = _mm256_xor_si256(u0, o), s1 = _mm256_xor_si256(u1, o);
             __m256i p0 = _mm256_maddubs_epi16(_mm256_abs_epi8(s0), _mm256_sign_epi8(x0, s0));
             __m256i p1 = _mm256_maddubs_epi16(_mm256_abs_epi8(s1), _mm256_sign_epi8(x1, s1));
-            __m256i i0 = _mm256_madd_epi16(_mm256_add_epi16(p0, p1), _mm256_set1_epi16(1));
+            const __m256i ones = _mm256_set1_epi16(1);
+            __m256i i0 = _mm256_add_epi32(_mm256_madd_epi16(p0, ones), _mm256_madd_epi16(p1, ones));
 #endif
             const float dd = _cvtsh_ss(d0[g]);
             acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i0), _mm256_set1_ps(dd * a->s[g]), acc);
@@ -1209,9 +1216,31 @@ void inz_matvec_f16_rows(const uint16_t *W, int cols, const float *x, float *y, 
     }
 }
 
+static inline __attribute__((always_inline)) void mm_f16_small(const uint16_t *W, int K, const float *X, int ldx,
+                                                              int n, float *Y, int ldy, int r0, int r1) {
+    for (int r = r0; r < r1; r++) {
+        const uint16_t *w = W + (size_t)r * K;
+        __m256 acc[3];
+        for (int t = 0; t < n; t++) acc[t] = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= K; k += 8) {
+            const __m256 v = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + k)));
+            for (int t = 0; t < n; t++)
+                acc[t] = _mm256_fmadd_ps(v, _mm256_loadu_ps(X + (size_t)t * ldx + k), acc[t]);
+        }
+        for (int t = 0; t < n; t++) {
+            float sum = hsum8(acc[t]);
+            for (int j = k; j < K; j++) sum += inz_f16_to_f32(w[j]) * X[(size_t)t * ldx + j];
+            Y[(size_t)t * ldy + r] = sum;
+        }
+    }
+}
+
 // Multi-token F16 matmul for the exact recipe: 3 weight rows x 4 tokens of accumulators in registers, tokens in
 // blocks of 32 so the activations of a block stay in L2 while the thread's rows stream past them. K % 8 == 0.
 void inz_matmul_f16_rows(const uint16_t *W, int K, const float *X, int ldx, int n, float *Y, int ldy, int r0, int r1) {
+    if (n == 2) { mm_f16_small(W, K, X, ldx, 2, Y, ldy, r0, r1); return; }
+    if (n == 3) { mm_f16_small(W, K, X, ldx, 3, Y, ldy, r0, r1); return; }
 #define CV(p) _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p)))
     for (int tb = 0; tb < n; tb += 32) {
         const int te = tb + 32 < n ? tb + 32 : n;

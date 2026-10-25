@@ -208,7 +208,7 @@ void q_imx_write(inz_engine *e) {
 }
 
 // Y[t*ldy + r] = W[r] . X[t*ldx]  for t < n, r < W->rows
-static void lin_mm(inz_engine *e, const lin *W, const float *X, int ldx, int n, float *Y, int ldy) {
+static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const float *X, int ldx, int n, float *Y, int ldy) {
     if (W->imx) {
         imx_entry *x = &e->imx[W->imx - 1];
         imx_add(x->acc, X, ldx, n, W->cols);
@@ -216,20 +216,30 @@ static void lin_mm(inz_engine *e, const lin *W, const float *X, int ldx, int n, 
     }
     if (W->type != INZ_T_F32 && W->type != INZ_T_F16) {
         const inz_qmat *m = &W->q;
+        const bool reuse = prev && prev->type != INZ_T_F32 && prev->type != INZ_T_F16 &&
+                           prev->cols == W->cols && prev->q.rot_block == m->rot_block && prev->q.rot_seed == m->rot_seed;
         if (n >= GEMM_MIN_T) {
-            inz_xq_begin(&e->gemm_x, n, m->cols, m->rot_block, m->rot_seed);
-            xq_job xj = {&e->gemm_x, X, ldx, e->gemm_tmp};
-            tp_for(e->tp, n, 4, xq_task, &xj);
+            if (!reuse) {
+                inz_xq_begin(&e->gemm_x, n, m->cols, m->rot_block, m->rot_seed);
+                xq_job xj = {&e->gemm_x, X, ldx, e->gemm_tmp};
+                tp_for(e->tp, n, 4, xq_task, &xj);
+            }
             gemm_job gj = {m, &e->gemm_x, Y, ldy, e->gemm_tb};
             tp_for(e->tp, (m->rows + 15) / 16, 1, gemm_task, &gj);
             return;
         }
-        aq_job aj = {e->acts, X, ldx, W->cols, m->rot_block, m->rot_seed};
-        tp_for(e->tp, n, 1, aq_task, &aj);
+        if (!reuse) {
+            aq_job aj = {e->acts, X, ldx, W->cols, m->rot_block, m->rot_seed};
+            tp_for(e->tp, n, 1, aq_task, &aj);
+        }
     }
     mm_job j = {W, X, ldx, n, Y, ldy, e->acts};
     const int grain = W->type == INZ_T_F16 && n > 1 ? (W->cols >= 6144 ? 12 : 24) : W->cols >= 6144 ? 16 : 32;
     tp_for(e->tp, W->rows, grain, mm_task, &j);
+}
+
+static void lin_mm(inz_engine *e, const lin *W, const float *X, int ldx, int n, float *Y, int ldy) {
+    lin_mm_after(e, W, NULL, X, ldx, n, Y, ldy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -401,7 +411,7 @@ static void ple_forward(inz_engine *e, int n, int p0, float *X) {
     ple_job j = {e, n, p0, X, e->tmp2, e->big, e->tmp, e->Xn};  // E [n][H], K [n][4H], V [n][H], G [n][4H]
     tp_for(e->tp, (int64_t)n * Q_NG_HEADS, 4, ple_gather_task, &j);
     lin_mm(e, &P->key, j.E, Q_H, n, j.K, Q_HCW);
-    lin_mm(e, &P->value, j.E, Q_H, n, j.V, Q_H);
+    lin_mm_after(e, &P->value, &P->key, j.E, Q_H, n, j.V, Q_H);
     tp_for(e->tp, n, 1, ple_gate_task, &j);    // K now holds norm_conv(G)
     tp_for(e->tp, n, 1, ple_conv_task, &j);
     // the conv history becomes the last 9 normalized rows (part of the old history when the chunk is short)
@@ -442,29 +452,32 @@ static void dn_prep_task(void *ctx, int64_t b, int64_t e_, int tid) {
     dn_job *j = ctx;
     const q_layer *L = j->L;
     const float *cs = j->e->st.conv + (size_t)j->li * (Q_DN_KS - 1) * Q_DN_CONV;  // last 3 inputs, oldest first
-    for (int64_t t = b; t < e_; t++) {
+    const int ratio = Q_DN_NV / Q_DN_NK;
+    for (int64_t item = b; item < e_; item++) {
+        const int t = (int)(item / Q_DN_NK), h = (int)(item % Q_DN_NK);
         const float *tap[4];
         for (int k = 0; k < 3; k++) {
-            const int d = 3 - k;                // input at t - d
+            const int d = 3 - k;
             tap[k] = t >= d ? j->qkv + (size_t)(t - d) * Q_DN_CONV : cs + (size_t)(3 - d + t) * Q_DN_CONV;
         }
         tap[3] = j->qkv + (size_t)t * Q_DN_CONV;
         float *cv = j->cv + (size_t)t * Q_DN_CONV;
-        for (int c = 0; c < Q_DN_CONV; c++) {
-            const float *w = L->dn_conv + (size_t)c * Q_DN_KS;
-            cv[c] = siluf(w[0] * tap[0][c] + w[1] * tap[1][c] + w[2] * tap[2][c] + w[3] * tap[3][c]);
+        for (int part = 0; part < 3; part++) {
+            const int first = part < 2 ? part * Q_DN_KEY + h * Q_DN_DK : 2 * Q_DN_KEY + h * ratio * Q_DN_DV;
+            const int count = part < 2 ? Q_DN_DK : ratio * Q_DN_DV;
+            for (int c = first; c < first + count; c++) {
+                const float *w = L->dn_conv + (size_t)c * Q_DN_KS;
+                cv[c] = siluf(w[0] * tap[0][c] + w[1] * tap[1][c] + w[2] * tap[2][c] + w[3] * tap[3][c]);
+            }
         }
-        float *q = cv, *k = cv + Q_DN_KEY;
-        for (int h = 0; h < Q_DN_NK; h++) {     // l2norm (eps inside the root), then q /= sqrt(dk)
-            float *qh = q + h * Q_DN_DK, *kh = k + h * Q_DN_DK;
-            const float sq = 1.0f / sqrtf(dot_f32(qh, qh, Q_DN_DK) + 1e-6f) / sqrtf((float)Q_DN_DK);
-            const float sk = 1.0f / sqrtf(dot_f32(kh, kh, Q_DN_DK) + 1e-6f);
-            for (int i = 0; i < Q_DN_DK; i++) { qh[i] *= sq; kh[i] *= sk; }
-        }
+        float *qh = cv + h * Q_DN_DK, *kh = cv + Q_DN_KEY + h * Q_DN_DK;
+        const float sq = 1.0f / sqrtf(dot_f32(qh, qh, Q_DN_DK) + 1e-6f) / sqrtf((float)Q_DN_DK);
+        const float sk = 1.0f / sqrtf(dot_f32(kh, kh, Q_DN_DK) + 1e-6f);
+        for (int i = 0; i < Q_DN_DK; i++) { qh[i] *= sq; kh[i] *= sk; }
         const float *ab = j->ab + (size_t)t * 2 * Q_DN_NV;
-        for (int h = 0; h < Q_DN_NV; h++) {
-            j->g[t * Q_DN_NV + h] = L->dn_negA[h] * softplusf(ab[h] + L->dn_dt[h]);
-            j->beta[t * Q_DN_NV + h] = sigmoidf(ab[Q_DN_NV + h]);
+        for (int v = h * ratio; v < (h + 1) * ratio; v++) {
+            j->g[t * Q_DN_NV + v] = L->dn_negA[v] * softplusf(ab[v] + L->dn_dt[v]);
+            j->beta[t * Q_DN_NV + v] = sigmoidf(ab[Q_DN_NV + v]);
         }
     }
 }
@@ -515,13 +528,12 @@ static void dn_scan_task(void *ctx, int64_t b, int64_t e_, int tid) {
 static void dn_out_task(void *ctx, int64_t b, int64_t e_, int tid) {
     (void)tid;
     dn_job *j = ctx;
-    for (int64_t t = b; t < e_; t++) {
-        float *ot = j->o + (size_t)t * Q_DN_VAL;
-        const float *zt = j->z + (size_t)t * Q_DN_VAL;
-        for (int h = 0; h < Q_DN_NV; h++) {
-            rmsnorm(ot + h * Q_DN_DV, ot + h * Q_DN_DV, j->L->dn_norm, Q_DN_DV);
-            for (int i = 0; i < Q_DN_DV; i++) ot[h * Q_DN_DV + i] *= sigmoidf(zt[h * Q_DN_DV + i]);
-        }
+    for (int64_t item = b; item < e_; item++) {
+        const int t = (int)(item / Q_DN_NV), h = (int)(item % Q_DN_NV);
+        float *ot = j->o + (size_t)t * Q_DN_VAL + h * Q_DN_DV;
+        const float *zt = j->z + (size_t)t * Q_DN_VAL + h * Q_DN_DV;
+        rmsnorm(ot, ot, j->L->dn_norm, Q_DN_DV);
+        for (int i = 0; i < Q_DN_DV; i++) ot[i] *= sigmoidf(zt[i]);
     }
 }
 
@@ -530,15 +542,15 @@ static void dn_block(inz_engine *e, int l, int n, const float *xin, float *y) {
     const int li = q_dn_index(l);
     float *qkv = e->big, *z = e->tmp2, *o = e->tmp, *cv = e->Xn;  // [n][10240], [n][6144], [n][6144], [n][10240]
     lin_mm(e, &L->dn_qkv, xin, Q_H, n, qkv, Q_DN_CONV);
-    lin_mm(e, &L->dn_z, xin, Q_H, n, z, Q_DN_VAL);
+    lin_mm_after(e, &L->dn_z, &L->dn_qkv, xin, Q_H, n, z, Q_DN_VAL);
     lin abl;
     q_bind_lin(&abl, INZ_T_F32, 2 * Q_DN_NV, Q_H, (const uint8_t *)L->dn_ab);
     float *abm = e->dn_ab, *g = e->dn_g, *beta = e->dn_beta;
     lin_mm(e, &abl, xin, Q_H, n, abm, 2 * Q_DN_NV);
     dn_job j = {e, L, li, n, qkv, cv, abm, g, beta, o, z};
-    tp_for(e->tp, n, 1, dn_prep_task, &j);
+    tp_for(e->tp, (int64_t)n * Q_DN_NK, 1, dn_prep_task, &j);
     tp_for(e->tp, Q_DN_NV, 1, dn_scan_task, &j);
-    tp_for(e->tp, n, 1, dn_out_task, &j);
+    tp_for(e->tp, (int64_t)n * Q_DN_NV, 2, dn_out_task, &j);
     // conv state: the last 3 raw inputs (part of the old state when the chunk is short); speculative snapshots
     // take the state after each draft position
     float *cs = e->st.conv + (size_t)li * (Q_DN_KS - 1) * Q_DN_CONV;
@@ -654,8 +666,8 @@ static void qsa_block(inz_engine *e, const q_layer *L, int ai, int n, int p0, co
     float *kv = e->tmp;                         // [n][1024]: k | v
     float *idx = e->tmp2;                       // [n][640]: 4 index query heads | index key
     lin_mm(e, &L->at_q, xin, Q_H, n, qg, Q_QPROJ);
-    lin_mm(e, &L->at_kv, xin, Q_H, n, kv, 2 * Q_KV);
-    lin_mm(e, &L->at_idx, xin, Q_H, n, idx, Q_IDX_PROJ);
+    lin_mm_after(e, &L->at_kv, &L->at_q, xin, Q_H, n, kv, 2 * Q_KV);
+    lin_mm_after(e, &L->at_idx, &L->at_kv, xin, Q_H, n, idx, Q_IDX_PROJ);
     float *q = e->Xn;                           // [n][24][256] (Xn is free inside a block)
     float *gate = e->Xn + (size_t)Q_MAX_T * Q_NH * Q_HD;
     float *iq = e->y;                           // [n][4][128] (y is written only by o_proj, at the end)
@@ -837,6 +849,7 @@ static void experts_batch(inz_engine *e, const unit *const *us, const uint8_t *c
 
 // l: expert cache layer (0..47, n_layer for the MTP layer)
 static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float *xin, float *y) {
+    const uint64_t io_start = ec_read_bytes(e->ec);
     e->imx_layer = l;
     float *logits = e->tmp;                     // [n][512]
     uint64_t t0 = diag_tsc();
@@ -850,14 +863,9 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
         softmax_inplace(pr, Q_N_EXPERT);
         int32_t sel[Q_TOPK];
         float w[Q_TOPK], sum = 0;
-        bool used[Q_N_EXPERT] = {0};
-        for (int k = 0; k < Q_TOPK; k++) {      // top-k by probability, lowest index first on ties
-            int best = -1;
-            for (int x = 0; x < Q_N_EXPERT; x++)
-                if (!used[x] && (best < 0 || pr[x] > pr[best])) best = x;
-            used[best] = true;
-            sel[k] = best;
-            w[k] = pr[best];
+        topk_f32(pr, Q_N_EXPERT, Q_TOPK, sel);
+        for (int k = 0; k < Q_TOPK; k++) {
+            w[k] = pr[sel[k]];
             sum += w[k];
         }
         diag_routing(l, sel, w, Q_TOPK, e->n_past + t);
@@ -884,7 +892,6 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
     memset(y, 0, sizeof(float) * (size_t)n * Q_H);
     // routed experts: read requests for every missing one first, then the next layer's predicted experts
     // (decode), then compute the resident ones while the SSD works, then the rest as they arrive
-    t0 = diag_tsc();
     bool done[Q_N_EXPERT] = {0}, asked[Q_N_EXPERT] = {0};
     int left = nu, lvl;
     if (n <= 8)
@@ -898,18 +905,23 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
         for (int t = 0; t < n; t++) {
             const float *lg = lg2 + (size_t)t * Q_N_EXPERT;
             int32_t ps[Q_TOPK];
-            bool used[Q_N_EXPERT] = {0};
-            for (int k = 0; k < Q_TOPK; k++) {
-                int best = -1;
-                for (int x = 0; x < Q_N_EXPERT; x++) if (!used[x] && (best < 0 || lg[x] > lg[best])) best = x;
-                used[best] = true;
-                ps[k] = best;
-                ec_prefetch(e->ec, l + 1, best, 0.5f, EC_FULL);
-            }
+            topk_f32(lg, Q_N_EXPERT, Q_TOPK, ps);
+            for (int k = 0; k < Q_TOPK; k++) ec_prefetch(e->ec, l + 1, ps[k], 0.5f, EC_FULL);
             if (n == 1) { memcpy(e->pred[l + 1], ps, sizeof(ps)); e->pred_valid[l + 1] = true; g_diag.pred_total += Q_TOPK; }
         }
         diag_add(DG_PREFETCH, l, tl, q_lin_bytes(&e->L[l + 1].router), 0);
     }
+    // Compute the shared expert while the requested experts are arriving.
+    t0 = diag_tsc();
+    float *GU = e->big, *D = e->tmp2;
+    lin_mm(e, &L->sh_gu, xin, Q_H, n, GU, 2 * Q_SHARED_FF);
+    for (int t = 0; t < n; t++) {
+        float *r = GU + (size_t)t * 2 * Q_SHARED_FF;
+        for (int c = 0; c < Q_SHARED_FF; c++) r[c] = siluf(r[c]) * r[Q_SHARED_FF + c];
+    }
+    lin_mm(e, &L->sh_down, GU, 2 * Q_SHARED_FF, n, D, Q_H);
+    diag_add(DG_SHARED, l, t0, q_lin_bytes(&L->sh_gu) + q_lin_bytes(&L->sh_down), 0);
+    t0 = diag_tsc();
     const bool batch = n <= 8 && nu <= EB_MAX && !e->imx_exp && e->expert_type != INZ_T_F16 && e->expert_type != INZ_T_F32;
     const unit *bu[EB_MAX];
     const uint8_t *bb[EB_MAX];
@@ -933,28 +945,44 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
     t0 = diag_tsc();
     while (left > 0) {
         bool progress = false;
+        nb = 0;
         for (int i = 0; i < nu; i++) {
             if (done[i]) continue;
             const uint8_t *b = ec_try_acquire(e->ec, l, units[i].expert, 0, EC_FULL, &lvl);
             if (!b) continue;
-            expert_compute(e, b, &units[i], xin, e->moe_out);
-            ec_release(e->ec, l, units[i].expert);
+            if (batch) { bu[nb] = &units[i]; bb[nb++] = b; }
+            else {
+                expert_compute(e, b, &units[i], xin, e->moe_out);
+                ec_release(e->ec, l, units[i].expert);
+            }
             done[i] = true;
             left--;
             progress = true;
         }
+        if (nb) {
+            experts_batch(e, bu, bb, nb, n, xin);
+            for (int i = 0; i < nb; i++) ec_release(e->ec, l, bu[i]->expert);
+        }
         if (progress || left == 0) continue;
+        diag_add(DG_EXPERT_MISS, l, t0, 0, 0);
+        t0 = diag_tsc();
         if (!ec_wait_any(e->ec)) {              // nothing in flight: fall back to a blocking read
             for (int i = 0; i < nu; i++)
                 if (!done[i]) {
                     const uint8_t *b = ec_acquire(e->ec, l, units[i].expert, 0, EC_FULL, &lvl);
+                    diag_add(DG_EXPERT_WAIT, l, t0, 0, 0);
+                    t0 = diag_tsc();
                     expert_compute(e, b, &units[i], xin, e->moe_out);
                     ec_release(e->ec, l, units[i].expert);
                     done[i] = true;
                     left--;
+                    diag_add(DG_EXPERT_MISS, l, t0, e->blob_bytes, 0);
+                    t0 = diag_tsc();
                     break;
                 }
         }
+        diag_add(DG_EXPERT_WAIT, l, t0, 0, 0);
+        t0 = diag_tsc();
     }
     diag_add(DG_EXPERT_MISS, l, t0, 0, 0);
     for (int t = 0; t < n; t++) {                // routed outputs in rank order: deterministic
@@ -966,20 +994,14 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
     }
     // shared expert: y += sigmoid(sh_gate . x) * down(silu(gate x) * up x)
     t0 = diag_tsc();
-    float *GU = e->big, *D = e->tmp2;
-    lin_mm(e, &L->sh_gu, xin, Q_H, n, GU, 2 * Q_SHARED_FF);
-    for (int t = 0; t < n; t++) {
-        float *r = GU + (size_t)t * 2 * Q_SHARED_FF;
-        for (int c = 0; c < Q_SHARED_FF; c++) r[c] = siluf(r[c]) * r[Q_SHARED_FF + c];
-    }
-    lin_mm(e, &L->sh_down, GU, 2 * Q_SHARED_FF, n, D, Q_H);
     for (int t = 0; t < n; t++) {
         const float sg = sigmoidf(dot_f32(L->sh_gate, xin + (size_t)t * Q_H, Q_H));
         float *yt = y + (size_t)t * Q_H;
         const float *dt = D + (size_t)t * Q_H;
         for (int c = 0; c < Q_H; c++) yt[c] += sg * dt[c];
     }
-    diag_add(DG_SHARED, l, t0, q_lin_bytes(&L->sh_gu) + q_lin_bytes(&L->sh_down), 0);
+    diag_add(DG_SHARED, l, t0, 0, 0);
+    diag_add_ssd(DG_PREFETCH, l, ec_read_bytes(e->ec) - io_start);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1101,7 +1123,7 @@ void q_forward(inz_engine *e, const int32_t *tokens, int n, const int *logits_ro
     }
     e->n_past += n;
     memcpy(e->x_last, e->X + (size_t)(n - 1) * Q_HCW, sizeof(float) * Q_HCW);
-    if (e->ec) ec_tick(e->ec);
+    if (e->ec) ec_tick(e->ec, n);
     if (n_logits <= 0) return;
     q_head(e, &e->mixer, e->X, n, logits_rows, n_logits, out_logits);
 }
@@ -1135,25 +1157,26 @@ static void head_rows_task(void *ctx, int64_t b, int64_t e_, int tid) {
     }
 }
 
-// Two-stage head for one row: the screen scored every token; rescore exactly the tokens within a fixed margin of
-// the best (6 sigma + 2 nats for the Q4L screen's measured error, sigma ~ 0.23), then remove the noise bias of the
-// unscored tail. The margin is fixed, not adaptive, so a row's logits depend on that row only: a token gets the
-// same logits whether it is decoded alone or inside a speculative verify pass.
+// Rescore nearby candidates; bounded retries and a rank fallback handle ties.
 #define HEAD_MARGIN 3.5f
 static void head_rescore(inz_engine *e, const float *x, float *lg) {
     float mx = -INFINITY;
     for (int v = 0; v < Q_VOCAB; v++) mx = lg[v] > mx ? lg[v] : mx;
     int32_t *cand = inz_malloc(sizeof(int32_t) * HEAD_MAX_CAND);
+    int nc = 0;
     float margin = HEAD_MARGIN;
-    int nc;
-    for (;;) {
+    for (int attempt = 0; attempt < 16; attempt++) {
         nc = 0;
-        const float th = mx - margin;
-        for (int v = 0; v < Q_VOCAB && nc < HEAD_MAX_CAND; v++) if (lg[v] >= th) cand[nc++] = v;
+        for (int v = 0; v < Q_VOCAB; v++) if (lg[v] >= mx - margin) {
+            if (nc < HEAD_MAX_CAND) cand[nc] = v;
+            nc++;
+        }
         if (nc >= HEAD_MAX_CAND && margin > 1.0f) { margin *= 0.7f; continue; }
         if (nc < HEAD_MIN_CAND && margin < 64) { margin *= 1.5f; continue; }
         break;
     }
+    if (nc < HEAD_MIN_CAND || nc > HEAD_MAX_CAND)
+        nc = topk_f32(lg, Q_VOCAB, nc < HEAD_MIN_CAND ? HEAD_MIN_CAND : HEAD_MAX_CAND, cand);
     float *ex = inz_malloc(sizeof(float) * nc);
     head_job j = {e, cand, NULL, NULL, x, ex};
     if (e->head.type != INZ_T_F16) {
@@ -1226,6 +1249,9 @@ static void mtp_norm_task(void *ctx, int64_t b, int64_t e_, int tid) {
 void q_mtp_forward(inz_engine *e, const float *X, int ldx, const int32_t *next, int n, int p0, const int *logits_rows,
                    int n_logits, float *out_logits) {
     if (n > Q_MAX_T) inz_die("q_mtp_forward: %d tokens > %d", n, Q_MAX_T);
+    const diag_phase phase = g_diag.phase;
+    diag_set_phase(PH_DRAFT);
+    g_diag.phase_tokens[PH_DRAFT] += (uint64_t)n;
     const q_mtp *M = &e->mtp;
     uint64_t t0 = diag_tsc();
     // X0 = [fc_hidden . (rmsnorm(X_s) * norm_hid_s)]_s : 4n rows of H through one H x H matrix
@@ -1250,11 +1276,18 @@ void q_mtp_forward(inz_engine *e, const float *X, int ldx, const int32_t *next, 
     diag_add(DG_DRAFT, -1, t0, q_lin_bytes(&M->fc_hid) + q_lin_bytes(&M->fc_emb), 0);
     const q_layer *L = &M->L;
     const int l = e->n_layer;                   // the MTP layer's index in the expert cache and in diagnostics
+    t0 = diag_tsc();
     hc_in(e, &L->ahc, n, e->X2, e->xin, e->inj);
+    diag_add(DG_ATTN_NORM, l, t0, q_lin_bytes(&L->ahc.down) + q_lin_bytes(&L->ahc.up), 0);
+    t0 = diag_tsc();
     qsa_block(e, L, Q_N_ATTN, n, p0, e->xin, e->y);
+    diag_add(DG_ATTN_CORE, l, t0, q_lin_bytes(&L->at_q) + q_lin_bytes(&L->at_kv) + q_lin_bytes(&L->at_idx) + q_lin_bytes(&L->at_o), 0);
     hc_out(n, e->X2, e->inj, e->y);
+    t0 = diag_tsc();
     hc_in(e, &L->mhc, n, e->X2, e->xin, e->inj);
+    diag_add(DG_FFN_NORM, l, t0, q_lin_bytes(&L->mhc.down) + q_lin_bytes(&L->mhc.up), 0);
     moe_block(e, L, l, n, e->xin, e->y);
     hc_out(n, e->X2, e->inj, e->y);
     if (n_logits > 0) q_head(e, &M->mixer, e->X2, n, logits_rows, n_logits, out_logits);
+    diag_set_phase(phase);
 }

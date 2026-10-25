@@ -49,8 +49,8 @@ typedef struct {
 ec_cache *ec_open(const ec_config *cfg, char *err, int errlen);
 void ec_close(ec_cache *c);
 
-// Called once per forward pass (advances the decay clock).
-void ec_tick(ec_cache *c);
+void ec_tick(ec_cache *c, int tokens);
+uint64_t ec_read_bytes(const ec_cache *c);
 
 // Ask for an expert ahead of use at the given level. Returns true if already resident at that level.
 bool ec_prefetch(ec_cache *c, int layer, int expert, float weight, int level);

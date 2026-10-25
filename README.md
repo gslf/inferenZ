@@ -51,7 +51,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 ### Memory
 
-The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM) to the rest of the system. On the 62 GB reference laptop that gives the cache about 35 GiB (57% of the experts) and the whole engine about 42 GB.
+The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM) to the rest of the system. If the minimum cache does not fit, startup stops with a clear error. On the 62 GB reference laptop that gives the cache about 35 GiB (57% of the experts) and the whole engine about 42 GB.
 
 - **`Killed` at start-up, or a sluggish desktop**, means the system ran short of memory: close other large programs, or give the engine less with `--cache 30G` or a larger `--ram-reserve`.
 - **On a machine doing nothing else**, `--ram-reserve 8` leaves more room to the cache, which is faster.
@@ -60,11 +60,13 @@ The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM
 
 ## References
 
+- **Recent improvements.** [Speed and reliability](docs/ANALISI-2026-10-25.md).
+
 - **Architecture overview.** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Diagnostics.** [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)
 - **OpenAI-compatible API**: chat (reasoning, tools, streaming), completions. [docs/API.md](docs/API.md)
-- **The model.** How Qwen3.8-Flash-Next works, in plain words: [docs/MODEL.md](docs/MODEL.md). inferenZ computes it exactly as the official implementation does, to float32 rounding on every layer: hidden states within 1e-4, identical logits. This holds for long prompts where the sparse attention selects blocks, for the n-gram resets at end-of-text, and through the speculative rewind.
-- **Exact and quantized recipes.** F16 keeps every BF16/FP8 value exactly. LUT quants (`Q4L`, `Q3L`) and `Q8G` use Hadamard rotation, learned non-uniform levels, and `PSHUFB` + `VPDPBUSD` decode at DRAM speed on hybrid P/E cores. Each recipe's cost is measured as next-token KL against the exact engine. [docs/QUANTIZATION.md](docs/QUANTIZATION.md)
+- **The model.** [How it works](docs/MODEL.md). Quantized weights and the fast output screen are approximations; validation compares their predictions with the reference model.
+- **Precision and speed.** [Weight formats and calibration](docs/QUANTIZATION.md).
 - **SSD expert streaming.** One 4 KiB-aligned blob per expert, `io_uring` + `O_DIRECT`, an LRFU cache, router lookahead prefetch, and missing experts computed in arrival order. [docs/STREAMING.md](docs/STREAMING.md)
 - **MTP speculative decoding** with exact speculative sampling. The 113 MB recurrent state is snapshotted during verification, so a rejected draft costs a copy. [docs/SPECULATIVE.md](docs/SPECULATIVE.md)
 

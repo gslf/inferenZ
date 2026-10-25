@@ -22,7 +22,7 @@ The MTP layer's experts live in the same SSD-backed cache as the others, as laye
 ## One step
 
 1. **Token.** `tok` is the token sampled at the previous step, at position P.
-2. **Draft.** The MTP layer fills its pending slots (P − m … P − 1, the last one with `tok`) and drafts `d0`. With `--spec-k` 2 or 3, further MTP steps on its own residual draft `d1` and `d2`.
+2. **Draft.** The MTP layer fills its pending slots (P − m … P − 1, the last one with `tok`) and drafts `d0`. With `--spec-k` 2 or 3, further MTP steps continue from its newest output to draft `d1` and `d2`.
 3. **Verify.** One pass of the main model over `[tok, d0 … d(k−1)]`, at positions P … P + k, gives the logits of every row.
 4. **Accept.** Speculative sampling decides, position by position, which drafts to keep.
 5. **Rewind.** If a draft is rejected, the recurrent state goes back to the snapshot taken after the last accepted token.

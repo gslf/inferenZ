@@ -36,6 +36,8 @@ int sampler_dist(sampler *s, float *logits, const int32_t *history, int n_histor
 // probability of `tok` under the same transformation (used for speculative acceptance)
 float sampler_prob_of(sampler *s, const float *logits, int tok);
 int argmax_f32(const float *x, int n);
+// Descending values, lower token ID first on ties. k <= 0 selects all n.
+int topk_f32(const float *x, int n, int k, int *idx);
 // log-softmax helpers for diagnostics
 float logsumexp_f32(const float *x, int n);
 uint64_t sampler_rand_u64(sampler *s);

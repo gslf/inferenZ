@@ -108,7 +108,13 @@ ec_cache *ec_open(const ec_config *cfg, char *err, int errlen) {
     uint64_t want = cfg->all_resident ? (uint64_t)nk * c->blob : cfg->cache_bytes;
     uint64_t slots = want / c->blob;
     if (slots > nk) slots = nk;
-    if (slots < (uint64_t)cfg->n_expert) slots = (uint64_t)cfg->n_expert;
+    if (slots < (uint64_t)cfg->n_expert) {
+        snprintf(err, errlen, "cache needs at least %.2f GiB", cfg->n_expert * c->blob / 1073741824.0);
+        close(c->fd);
+        free(c->off);
+        free(c);
+        return NULL;
+    }
     c->n_slots = (uint32_t)slots;
     c->arena_bytes = slots * c->blob;
     c->arena = inz_mmap_anon(c->arena_bytes, true);
@@ -124,7 +130,7 @@ ec_cache *ec_open(const ec_config *cfg, char *err, int errlen) {
     c->crf = inz_calloc(nk, sizeof(float));
     c->crf_tick = inz_calloc(nk, sizeof(uint32_t));
     c->use_count = inz_calloc(nk, sizeof(uint64_t));
-    c->lambda = cfg->decay > 0 ? cfg->decay : 0.002f;
+    c->lambda = cfg->decay >= 0 ? cfg->decay : 0.002f;
     c->qd = cfg->queue_depth > 0 ? cfg->queue_depth : 64;
     c->rng = 0x2545F4914F6CDD1Dull;
     fifo_init(&c->pq[0], (int)slots + 2);
@@ -185,7 +191,8 @@ void ec_close(ec_cache *c) {
     free(c);
 }
 
-void ec_tick(ec_cache *c) { c->tick++; }
+void ec_tick(ec_cache *c, int tokens) { c->tick += (uint32_t)tokens; }
+uint64_t ec_read_bytes(const ec_cache *c) { return c->st.bytes_read; }
 
 static int lat_bucket(double s) {
     double us = s * 1e6;

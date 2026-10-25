@@ -3,6 +3,7 @@
 
 #include <immintrin.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -69,9 +70,11 @@ static void apply_penalties(sampler *s, float *logits, const int32_t *hist, int 
     if (p->repeat_penalty != 1.0f && p->repeat_penalty > 0) {
         int start = nh - p->repeat_last_n;
         if (start < 0 || p->repeat_last_n <= 0) start = 0;
+        for (int i = start; i < nh; i++) if (hist[i] >= 0 && hist[i] < s->vocab) s->prob[hist[i]] = 0;
         for (int i = start; i < nh; i++) {
             int t = hist[i];
-            if (t < 0 || t >= s->vocab) continue;
+            if (t < 0 || t >= s->vocab || s->prob[t]) continue;
+            s->prob[t] = 1;
             float l = logits[t];
             logits[t] = l > 0 ? l / p->repeat_penalty : l * p->repeat_penalty;
         }
@@ -92,43 +95,35 @@ static void apply_penalties(sampler *s, float *logits, const int32_t *hist, int 
 static int cmp_desc(const void *a, const void *b, void *ctx) {
     const float *pr = ctx;
     float x = pr[*(const int *)a], y = pr[*(const int *)b];
-    return x < y ? 1 : x > y ? -1 : 0;
+    return x < y ? 1 : x > y ? -1 : (*(const int *)a > *(const int *)b) - (*(const int *)a < *(const int *)b);
 }
 
-// Candidates for sampling: the K highest logits (K = top_k, capped at 4096), sorted descending.
-// Selection is O(vocab): a 1024-bin histogram of logits finds the threshold of the K-th value, then only the
-// survivors are sorted. The softmax mass outside the candidates is returned in *tail_mass (relative to
-// exp(max/T)), so top-p is computed against the full distribution, not only against the survivors.
-static int select_top(sampler *s, const float *logits, int k, float inv_t, double *tail_mass) {
-    const int n = s->vocab;
-    float mx = logits[argmax_f32(logits, n)];
-    float mn = mx - 40.0f / (inv_t > 0 ? inv_t : 1.0f);
-    if (k <= 0 || k > 4096) k = 4096;
-    enum { NB = 1024 };
-    int hist[NB] = {0};
-    const float scale = (NB - 1) / (mx - mn);
-    for (int i = 0; i < n; i++) {
-        float v = logits[i];
-        if (v < mn) continue;
-        hist[(int)((mx - v) * scale)]++;
+static bool better(const float *x, int a, int b) {
+    return x[a] > x[b] || (x[a] == x[b] && a < b);
+}
+
+static void sift(const float *x, int *idx, int k, int p) {
+    int v = idx[p];
+    for (int c = 2 * p + 1; c < k; c = 2 * p + 1) {
+        if (c + 1 < k && better(x, idx[c], idx[c + 1])) c++;
+        if (!better(x, v, idx[c])) break;
+        idx[p] = idx[c];
+        p = c;
     }
-    int acc = 0, cut = NB - 1;
-    for (int b = 0; b < NB; b++) { acc += hist[b]; if (acc >= k) { cut = b; break; } }
-    const float th = mx - (float)(cut + 1) / scale;
-    int c = 0;
-    double tail = 0;
-    for (int i = 0; i < n; i++) {
-        float v = logits[i];
-        if (v >= th && c < 8192) s->idx[c++] = i;
-        else if (tail_mass && v >= mn) tail += exp((double)(v - mx) * inv_t);
+    idx[p] = v;
+}
+
+int topk_f32(const float *x, int n, int k, int *idx) {
+    if (k <= 0 || k > n) k = n;
+    for (int i = 0; i < k; i++) idx[i] = i;
+    for (int i = k / 2; i-- > 0;) sift(x, idx, k, i);
+    for (int i = k; i < n; i++) {
+        if (!better(x, i, idx[0])) continue;
+        idx[0] = i;
+        sift(x, idx, k, 0);
     }
-    qsort_r(s->idx, c, sizeof(int), cmp_desc, (void *)logits);
-    if (c > k) {
-        if (tail_mass) for (int i = k; i < c; i++) tail += exp((double)(logits[s->idx[i]] - mx) * inv_t);
-        c = k;
-    }
-    if (tail_mass) *tail_mass = tail;
-    return c;
+    qsort_r(idx, k, sizeof(int), cmp_desc, (void *)x);
+    return k;
 }
 
 int sampler_sample(sampler *s, float *logits, const int32_t *hist, int nh) {
@@ -154,10 +149,9 @@ int sampler_dist(sampler *s, float *logits, const int32_t *hist, int nh, const i
         return 1;
     }
     const float inv_t = 1.0f / p->temperature;
-    double tail = 0;
-    int c = select_top(s, logits, p->top_k > 0 ? p->top_k : 0, inv_t, p->top_k > 0 ? NULL : &tail);
+    int c = topk_f32(logits, s->vocab, p->top_k, s->idx);
     float m = logits[s->idx[0]];
-    double sum = tail;  // relative to the whole vocabulary: top-p must account for the tail
+    double sum = 0;
     for (int i = 0; i < c; i++) { s->prob[i] = expf((logits[s->idx[i]] - m) * inv_t); sum += s->prob[i]; }
     for (int i = 0; i < c; i++) s->prob[i] = (float)(s->prob[i] / sum);
     if (p->min_p > 0) {

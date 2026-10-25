@@ -175,7 +175,9 @@ static void *worker(void *arg) {
 }
 
 tp_pool *tp_create(int n_threads, const int *cpus) {
-    tp_pool *p = calloc(1, sizeof(*p));
+    tp_pool *p = aligned_alloc(64, sizeof(*p));
+    if (!p) return NULL;
+    memset(p, 0, sizeof(*p));
     tp_topology topo;
     tp_detect_topology(&topo);
     if (n_threads <= 0) n_threads = topo.n_cpu;
@@ -184,11 +186,13 @@ tp_pool *tp_create(int n_threads, const int *cpus) {
     if (cpus) {
         memcpy(p->cpus, cpus, sizeof(int) * n_threads);
     } else {
-        // fastest first: P cores (one per physical core first, then siblings), E, LP-E
-        int k = 0;
+        int k = tp_default_cpus(&topo, p->cpus, n_threads);
         for (int cls = 0; cls < 3 && k < n_threads; cls++)
-            for (int i = 0; i < topo.n_cpu && k < n_threads; i++)
-                if (topo.cpu_class[i] == cls) p->cpus[k++] = topo.cpu_id[i];
+            for (int i = 0; i < topo.n_cpu && k < n_threads; i++) {
+                bool used = false;
+                for (int j = 0; j < k; j++) used |= p->cpus[j] == topo.cpu_id[i];
+                if (topo.cpu_class[i] == cls && !used) p->cpus[k++] = topo.cpu_id[i];
+            }
         for (; k < n_threads; k++) p->cpus[k] = -1;
     }
     p->collect = true;
