@@ -69,6 +69,8 @@ float *engine_eval_logits_ex(inz_engine *e, const int32_t *tokens, int n, int la
 float *engine_eval_logits(inz_engine *e, const int32_t *tokens, int n);
 // validation of the speculative rewind (see engine.c); same output as engine_eval_logits_ex(..., last, false)
 float *engine_eval_snapshots(inz_engine *e, const int32_t *tokens, int n, int last);
+// validation of the MTP head: draft logits of slots 0 .. n-2 ([n - 1][vocab]), NULL without the MTP head
+float *engine_eval_mtp_logits(inz_engine *e, const int32_t *tokens, int n);
 int engine_vocab(void);
 
 // Diagnostics snapshot (JSON object written into w): state, diag, cache, memory, config.

@@ -794,6 +794,25 @@ float *engine_eval_snapshots(inz_engine *e, const int32_t *tokens, int n, int la
 
 float *engine_eval_logits(inz_engine *e, const int32_t *tokens, int n) { return engine_eval_logits_ex(e, tokens, n, 0, false); }
 
+// Validation of the MTP head: the main model over tokens [0, n), then the MTP slots 0 .. n-2, slot t with the token at
+// t + 1. Returns malloc'ed [n - 1][vocab] draft logits (NULL without the MTP head).
+float *engine_eval_mtp_logits(inz_engine *e, const int32_t *tokens, int n) {
+    if (!e->mtp.present || n < 2 || n > Q_MAX_T) return NULL;
+    float *out = inz_malloc(sizeof(float) * (size_t)(n - 1) * Q_VOCAB);
+    q_state_reset(e);
+    e->ck_pos = -1;
+    e->mtp_valid = -1;
+    q_forward(e, tokens, n, NULL, 0, NULL);
+    int rows[Q_MAX_T];
+    for (int i = 0; i < n - 1; i++) rows[i] = i;
+    for (int i = 0; i < n - 1; i += 64) {  // the head takes up to 64 rows per call
+        const int k = n - 1 - i < 64 ? n - 1 - i : 64;
+        if (i == 0) q_mtp_forward(e, e->X, Q_H, true, tokens + 1, n - 1, 0, rows, k, out);
+        else q_head(e, e->X2, n - 1, rows + i, k, out + (size_t)i * Q_VOCAB);
+    }
+    return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Diagnostics snapshot                                                */
 /* ------------------------------------------------------------------ */

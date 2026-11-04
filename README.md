@@ -1,20 +1,20 @@
 # inferenZ
 
-**A single-model inference engine in C for Qwen3.8-Flash-Next (125B parameters, 6B active), running on CPU with experts streamed from the SSD.**
+**A single-model inference engine in C for NVIDIA Nemotron 3.5 Super (120B parameters, 12B active), running on CPU with experts streamed from the SSD.**
 
 Linux only. CPU only for now.
 
-Qwen3.8-Flash-Next is a hybrid model:
-- 48 layers: 36 Gated DeltaNet (linear attention with a recurrent state) and 12 sparse QSA attention layers;
-- 4-stream hyper-connections instead of a single residual;
-- a 512-expert MoE in every layer (top-10);
-- a 51 GB hashed n-gram embedding;
-- an MTP layer for speculative decoding.
+Nemotron 3.5 Super is a hybrid model:
+- 88 blocks: 40 Mamba-2 (a recurrent memory of fixed size), 8 attention, 40 mixture-of-experts;
+- a LatentMoE: 512 experts per block, 22 chosen per token, working in a 1024-wide latent space;
+- an MTP head for speculative decoding.
+
+inferenZ runs the official NVFP4 release exactly as published: no weight is re-quantized.
 
 
 ## Quick start
 
-Requirements: Linux on x86-64 with AVX2 and AVX-VNNI, about 64 GB of RAM, gcc ≥ 15, liburing and OpenMP. The model must already be converted: see [Get the model and convert it](#get-the-model-and-convert-it) (the default file is `models/qwen3.8-flash-next-q4q8.inz.gguf`).
+Requirements: Linux on x86-64 with AVX2 and AVX-VNNI, about 64 GB of RAM, gcc ≥ 15, liburing and OpenMP. The model must already be converted: see [Get the model and convert it](#get-the-model-and-convert-it) (the default file is `models/nemotron-3.5-super.inz.gguf`).
 
 ```sh
 make
@@ -29,7 +29,7 @@ Open <http://127.0.0.1:8080> once the server prints `serving on http://127.0.0.1
 
 ### The web UI
 
-- **Thinking** sets the reasoning effort. At *high* the model may think for minutes before it answers; *medium* or *low* suit quick questions, *off* answers directly.
+- **Thinking**: *on* (the model's default) thinks before answering; *efficient* asks the model for shorter reasoning; *off* answers directly.
 - **Monitor** shows live speed, expert-cache hit rate, MTP acceptance and where each token's time goes.
 
 ### The terminal
@@ -51,7 +51,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 ### Memory
 
-The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM) to the rest of the system. If the minimum cache does not fit, startup stops with a clear error. On the 62 GB reference laptop that gives the cache about 35 GiB (57% of the experts) and the whole engine about 42 GB.
+The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM) to the rest of the system. If the minimum cache does not fit, startup stops with a clear error.
 
 - **`Killed` at start-up, or a sluggish desktop**, means the system ran short of memory: close other large programs, or give the engine less with `--cache 30G` or a larger `--ram-reserve`.
 - **On a machine doing nothing else**, `--ram-reserve 8` leaves more room to the cache, which is faster.
@@ -60,35 +60,27 @@ The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM
 
 ## References
 
-- **Recent improvements.** [Speed and reliability](docs/ANALISI-2026-10-25.md).
-
 - **Architecture overview.** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Diagnostics.** [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)
 - **OpenAI-compatible API**: chat (reasoning, tools, streaming), completions. [docs/API.md](docs/API.md)
-- **The model.** [How it works](docs/MODEL.md). Quantized weights and the fast output screen are approximations; validation compares their predictions with the reference model.
-- **Precision and speed.** [Weight formats and calibration](docs/QUANTIZATION.md).
+- **The model.** [How it works](docs/MODEL.md).
+- **Precision and speed.** [Weight formats](docs/QUANTIZATION.md): NVFP4 and FP8 kept exactly.
 - **SSD expert streaming.** One 4 KiB-aligned blob per expert, `io_uring` + `O_DIRECT`, an LRFU cache, router lookahead prefetch, and missing experts computed in arrival order. [docs/STREAMING.md](docs/STREAMING.md)
-- **MTP speculative decoding** with exact speculative sampling. The 113 MB recurrent state is snapshotted during verification, so a rejected draft costs a copy. [docs/SPECULATIVE.md](docs/SPECULATIVE.md)
+- **MTP speculative decoding** with exact speculative sampling. The 168 MB recurrent state is snapshotted during verification, so a rejected draft costs a copy. [docs/SPECULATIVE.md](docs/SPECULATIVE.md)
 
 
 
 ## Get the model and convert it
 
-`tools/hfget.py` downloads the official FP8 checkpoint in priority order: dense weights first, then the n-gram table, then the experts layer by layer. It resumes after interruptions. The converter can start while the download is still running.
+`tools/hfget.py` downloads the official NVFP4 checkpoint (73 GB without the vision encoder) in priority order: dense weights first, then the experts block by block. It resumes after interruptions. The converter can start while the download is still running.
 
 ```sh
 mkdir -p models && chattr +C models          # btrfs: no CoW/compression, so O_DIRECT works
-python3 -I tools/hfget.py Qwen/Qwen3.8-Flash-Next-FP8 models/Qwen3.8-Flash-Next-FP8 --skip-vision
-
-# 1. the exact recipe (also the reference for the others)
-./inz convert --src models/Qwen3.8-Flash-Next-FP8 --out models/qwen3.8-flash-next-q8.inz.gguf --head F16 --embed F16
-
-# 2. importance matrix: input statistics of every matrix on a calibration text (token ids, comma-separated)
-INZ_IMATRIX=qwen38.imx ./inz dump -m models/qwen3.8-flash-next-q8.inz.gguf --exact-head --tokens @calib.txt --last 1 --out /dev/null
-
-# 3. the recommended recipe
-./inz convert --src models/Qwen3.8-Flash-Next-FP8 --out models/qwen3.8-flash-next-q4q8.inz.gguf --imatrix qwen38.imx --experts Q4L --dense Q8G --hc Q8G --shared Q8G --ple Q8G --router F16 --head F16 --screen Q4L --embed F16
+python3 -I tools/hfget.py nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 models/Nemotron-3.5-Super-VL-NVFP4 --skip-vision
+./inz convert --src models/Nemotron-3.5-Super-VL-NVFP4 --out models/nemotron-3.5-super.inz.gguf
 ```
+
+The conversion copies every tensor exactly (NVFP4 → Q4N, FP8 → F8T, BF16 → F16) into a 74 GB file.
 
 
 
@@ -97,4 +89,4 @@ INZ_IMATRIX=qwen38.imx ./inz dump -m models/qwen3.8-flash-next-q8.inz.gguf --exa
 The code is under the MIT license ([LICENSE](LICENSE)).
 
 - `src/unicode_tables.inc` is generated from the Unicode Character Database (© Unicode, Inc., Unicode License v3).
-- The model weights are not part of this repository and are under their own license (see the model card).
+- The model weights are not part of this repository and are under their own license (OpenMDW-1.1, see the model card).

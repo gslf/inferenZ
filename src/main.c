@@ -285,7 +285,8 @@ static int cmd_convert(int argc, char **argv) {
 
 static int cmd_dump(int argc, char **argv) {
     // inz dump -m model --tokens 1,2,3 --out logits.f32 : raw float32 logits [n][vocab] for validation
-    const char *toks = NULL, *out = NULL;
+    // (--mtp FILE: also the MTP head's draft logits of slots 0 .. n-2)
+    const char *toks = NULL, *out = NULL, *mtp_out = NULL;
     int last = 0;
     bool stepwise = false, snaptest = false;
     for (int i = 1; i < argc; i++) {
@@ -294,6 +295,7 @@ static int cmd_dump(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc) toks = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--last") && i + 1 < argc) last = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mtp") && i + 1 < argc) mtp_out = argv[++i];
     }
     char *tokbuf = NULL;
     if (toks && toks[0] == '@') { tokbuf = inz_read_file(toks + 1, NULL); toks = tokbuf; }
@@ -302,7 +304,8 @@ static int cmd_dump(int argc, char **argv) {
     int na = 0;
     char *av[64];
     for (int i = 0; i < argc && na < 63; i++) {
-        if ((!strcmp(argv[i], "--tokens") || !strcmp(argv[i], "--out") || !strcmp(argv[i], "--last")) && i + 1 < argc) { i++; continue; }
+        if ((!strcmp(argv[i], "--tokens") || !strcmp(argv[i], "--out") || !strcmp(argv[i], "--last") || !strcmp(argv[i], "--mtp")) &&
+            i + 1 < argc) { i++; continue; }
         if (!strcmp(argv[i], "--stepwise") || !strcmp(argv[i], "--snaptest")) continue;
         av[na++] = argv[i];
     }
@@ -328,6 +331,14 @@ static int cmd_dump(int argc, char **argv) {
         printf("%d%s", best, t + 1 < n ? "," : "\n");
     }
     free(lg);
+    if (mtp_out) {
+        float *ml = engine_eval_mtp_logits(e, ids, n);
+        if (!ml) { fprintf(stderr, "inz dump: the model has no MTP head (or more than 512 tokens)\n"); engine_close(e); return 1; }
+        FILE *fm = fopen(mtp_out, "wb");
+        fwrite(ml, sizeof(float), (size_t)(n - 1) * engine_vocab(), fm);
+        fclose(fm);
+        free(ml);
+    }
     if (c.eo.verbose) {
         jw w;
         jw_init(&w);

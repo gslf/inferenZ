@@ -73,6 +73,15 @@ def main():
     if not os.path.exists(idx_path):
         open(idx_path, "wb").write(curl(base + "model.safetensors.index.json"))
     files = sorted(set(json.load(open(idx_path))["weight_map"].values()))
+    # the small files the converter and the reference read
+    for meta in ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        mp = os.path.join(a.out, meta)
+        if not os.path.exists(mp):
+            try:
+                open(mp + ".tmp", "wb").write(curl(base + meta, retries=3))
+                os.replace(mp + ".tmp", mp)
+            except RuntimeError:
+                say(f"{meta}: not in the repository")
 
     # headers (cached locally)
     hdr_dir = os.path.join(a.out, ".headers")
