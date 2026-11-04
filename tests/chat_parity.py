@@ -1,4 +1,4 @@
-# Compare the C chat template (tests/test_chat) with the official Jinja template of Qwen3.8-Flash-Next,
+# Compare the C chat template (tests/test_chat) with the official Jinja template of Nemotron 3.5 Super,
 # rendered the way transformers does (sandboxed Jinja, trim_blocks, lstrip_blocks, Python-style tojson).
 import json, subprocess, sys
 import jinja2, jinja2.ext
@@ -38,15 +38,34 @@ cases = [
                 {"role": "tool", "content": "2"}, {"role": "tool", "content": "42"}], "tools": [run_c, run_js], "effort": "low"},
   {"messages": [{"role": "user", "content": "no gen"}], "add_generation_prompt": False},
   {"messages": [{"role": "user", "content": "<tool_response>x</tool_response>"}, {"role": "user", "content": "real question"}]},
+  {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "<think>\nold\n</think>\n\nkept"},
+                {"role": "user", "content": "q2"}, {"role": "assistant", "content": "cur", "reasoning_content": "fresh"}], "add_generation_prompt": False},
+  {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "<think>open only", "tool_calls": [
+                    {"type": "function", "function": {"name": "run_js", "arguments": "{\"code\": \"1\"}"}}]},
+                {"role": "tool", "content": "1"}, {"role": "user", "content": "q2"}], "tools": [run_js]},
+  {"messages": [{"role": "tool", "content": "orphan"}, {"role": "user", "content": "after"}]},
+  {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "u"}], "effort": "medium",
+   "tools": [{"type": "function", "function": {"name": "pick", "description": "  Pick one  ", "x-extra": {"a": [1, 2]},
+              "parameters": {"type": "object", "additionalProperties": False, "properties": {
+                  "kind": {"type": "string", "enum": ["a", "b"], "description": "the kind", "default": "a"},
+                  "n": {"type": "integer", "minimum": 0, "nullable": True},
+                  "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["kind"]}}},
+             {"name": "bare", "parameters": {}}]},
+  {"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "  spaced  "}, {"role": "user", "content": "y"},
+                {"role": "assistant", "content": "", "reasoning_content": "  "}], "effort": "none", "add_generation_prompt": False},
 ]
 lines = [json.dumps(c) for c in cases]
 out = subprocess.run([exe], input=("\n".join(lines) + "\n").encode(), capture_output=True, check=True).stdout.split(b"\0")
 ok = 0
 for i, c in enumerate(cases):
-    kw = dict(messages=c["messages"], tools=c.get("tools"), add_generation_prompt=c.get("add_generation_prompt", True))
+    msgs = json.loads(json.dumps(c["messages"]))  # OpenAI clients send arguments as a JSON string: the engine parses it
+    for m in msgs:
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc["function"].get("arguments"), str): tc["function"]["arguments"] = json.loads(tc["function"]["arguments"])
+    kw = dict(messages=msgs, tools=c.get("tools"), add_generation_prompt=c.get("add_generation_prompt", True))
     eff = c.get("effort")
     if eff == "none": kw["enable_thinking"] = False
-    elif eff: kw["reasoning_effort"] = eff
+    elif eff in ("low", "medium"): kw["medium_effort"] = True
     ref = tpl.render(**kw)
     mine = out[i].decode()
     if ref == mine: ok += 1

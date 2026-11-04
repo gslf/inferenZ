@@ -1,5 +1,6 @@
 # model downloads and converted GGUFs
 /models/
+/tvenv/
 
 # build outputs
 /build/

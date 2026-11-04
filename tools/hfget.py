@@ -7,7 +7,7 @@ then routed experts layer by layer), so the converter can start on the dense par
 before the whole checkpoint has arrived. Completed ranges are appended to a journal,
 so an interrupted download resumes where it stopped.
 
-    python3 -I tools/hfget.py Qwen/Qwen3.8-Flash-Next-FP8 models/Qwen3.8-Flash-Next-FP8 [--workers 4] [--skip-vision]
+    python3 -I tools/hfget.py nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 models/Nemotron-3.5-Super-VL-NVFP4 [--workers 4] [--skip-vision]
 """
 import argparse
 import json
@@ -38,12 +38,12 @@ def curl(url, rng=None, retries=20):
 
 def priority(name):
     # (class, order): smaller first. Dense weights, then routed experts layer by layer, then the rest that is
-    # only read sparsely at runtime (MiniMax-M3.1-Flash and Qwen3.8-Flash-Next naming).
-    if "vision" in name or "visual" in name or "multi_modal" in name or "patch_merge" in name:
+    # only read sparsely at runtime (Qwen3.8-Flash-Next and Nemotron 3.5 naming).
+    if "vision" in name or "visual" in name or "multi_modal" in name or "patch_merge" in name or name.startswith("mlp1."):
         return (9, 0)
-    m = re.search(r"layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.", name)
+    m = re.search(r"layers\.(\d+)\.(?:block_sparse_moe|mlp|mixer)\.experts\.", name)
     if m:
-        return (6, 0) if name.startswith("mtp.") else (5, int(m.group(1)))
+        return (6, 0) if ".mtp." in "." + name else (5, int(m.group(1)))
     if "ngram_embedding" in name:
         return (4, 0)  # n-gram table: a few rows per token at runtime, but every forward pass needs it
     if ".dspark." in name or name.startswith("mtp."):

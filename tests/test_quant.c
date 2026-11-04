@@ -100,5 +100,91 @@ int main(int argc, char **argv) {
             inz_act_free(&a);
             free(buf);
         }
-    return 0;
+    int fails = 0;
+    {
+        // F8T: e4m3 codes (subnormals and negatives included) with a per-tensor scale must be exact, and the matmul
+        // rows bit-identical to the matvec's
+        uint8_t *w8 = malloc((size_t)rows * cols);
+        for (size_t i = 0; i < (size_t)rows * cols; i++) {
+            uint8_t v = (uint8_t)(seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 0;
+            v = (uint8_t)((seed >> 33) & 0xFF);
+            if ((v & 0x7F) == 0x7F) v ^= 1;  // no NaN
+            w8[i] = v;
+        }
+        const float scale = 0.0123f;
+        void *buf = inz_aligned(64, inz_qmat_bytes(INZ_T_F8T, rows, cols));
+        inz_pack_f8t(w8, scale, rows, cols, buf);
+        inz_qmat m;
+        inz_qmat_view(&m, buf);
+        float *row = malloc(sizeof(float) * cols);
+        double me = 0, worst = 0;
+        for (int r = 0; r < rows; r++) {
+            inz_dequantize_row(&m, r, row);
+            double s = 0, sa = 0;
+            for (int j = 0; j < cols; j++) {
+                const float ref = inz_e4m3_to_f32(w8[(size_t)r * cols + j]) * scale;
+                if (row[j] != ref) me = 1;
+                s += (double)ref * x[j];
+                sa += fabs((double)ref * x[j]);
+            }
+            yref[r] = (float)s;
+            row[0] = (float)sa;
+            y[r] = row[0];  // |terms| for the error bound
+        }
+        float *yv = malloc(sizeof(float) * rows), *Y = malloc(sizeof(float) * rows * 5);
+        inz_matvec_f8t_rows(&m, x, yv, 0, rows);
+        for (int r = 0; r < rows; r++) worst = fmax(worst, fabs(yv[r] - yref[r]) / (y[r] + 1e-30));
+        float *X = malloc(sizeof(float) * cols * 5);
+        for (int t = 0; t < 5; t++) memcpy(X + (size_t)t * cols, x, sizeof(float) * cols);
+        int ident = 1;
+        for (int n = 2; n <= 5; n++) {
+            inz_matmul_f8t_rows(&m, X, cols, n, Y, rows, 0, rows);
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < rows; r++) ident &= Y[(size_t)t * rows + r] == yv[r];
+        }
+        const int reps = 200;
+        double t0 = inz_now();
+        for (int k = 0; k < reps; k++) inz_matvec_f8t_rows(&m, x, yv, 0, rows);
+        const double el = inz_now() - t0;
+        printf("F8T  dequant exact %s  matvec max rel err %.2e  matmul == matvec %s  1-thread %.2f GB/s\n", me ? "NO" : "yes", worst,
+               ident ? "yes" : "NO", (double)rows * cols * reps / el / 1e9);
+        fails += me != 0 || worst > 1e-5 || !ident;
+        free(w8); free(buf); free(row); free(yv); free(Y); free(X);
+    }
+    {
+        // Q4N with zero and subnormal block scales (they occur in real checkpoints): the kernels must match the
+        // dequantized weights
+        uint8_t *pk = malloc((size_t)rows * cols / 2), *sc = malloc((size_t)rows * cols / 16);
+        for (size_t i = 0; i < (size_t)rows * cols / 2; i++) pk[i] = (uint8_t)((seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 40);
+        for (size_t i = 0; i < (size_t)rows * cols / 16; i++) {
+            const uint8_t v = (uint8_t)((seed = seed * 6364136223846793005ull + 1442695040888963407ull) >> 40) & 0x7F;
+            sc[i] = i % 7 == 0 ? 0 : i % 5 == 0 ? (v & 7) : v == 0x7F ? 0x7E : v;  // zeros, subnormals, normals
+        }
+        void *buf = inz_aligned(64, inz_qmat_bytes(INZ_T_Q4N, rows, cols));
+        const int ok = inz_pack_q4n_mul(pk, sc, 0.37f, rows, cols, buf);
+        inz_qmat m;
+        inz_qmat_view(&m, buf);
+        inz_act a;
+        inz_act_alloc(&a, cols);
+        inz_act_quantize(&a, x, cols, 0, 0);
+        float *row = malloc(sizeof(float) * cols);
+        double worst = 0;
+        inz_matvec_rows(&m, &a, y, 0, rows);
+        for (int r = 0; r < rows; r++) {
+            inz_dequantize_row(&m, r, row);
+            double s = 0, sa = 0;
+            for (int g = 0; g < cols / 64; g++)
+                for (int j = 0; j < 64; j++) {
+                    s += (double)row[g * 64 + j] * a.q[g * 64 + j] * a.s[g];  // same int8 activation as the kernel
+                    sa += fabs((double)row[g * 64 + j] * a.q[g * 64 + j] * a.s[g]);
+                }
+            worst = fmax(worst, fabs(y[r] - s) / (sa + 1e-30));
+        }
+        printf("Q4N  zero/subnormal block scales: pack %s, matvec max rel err %.2e\n", ok ? "ok" : "REFUSED", worst);
+        fails += !ok || worst > 1e-5;
+        inz_act_free(&a);
+        free(pk); free(sc); free(buf); free(row);
+    }
+    if (fails) printf("FAILED: %d check(s)\n", fails);
+    return fails ? 1 : 0;
 }

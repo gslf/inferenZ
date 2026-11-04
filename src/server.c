@@ -227,7 +227,7 @@ static void parse_sampling(const jval *req, gen_opts *go) {
     sampler_default(&go->sp);
     go->sp.temperature = (float)json_num(json_get(req, "temperature"), 1.0);
     go->sp.top_p = (float)json_num(json_get(req, "top_p"), 0.95);
-    go->sp.top_k = (int)json_num(json_get(req, "top_k"), 20);  // defaults from the model's generation_config.json
+    go->sp.top_k = (int)json_num(json_get(req, "top_k"), 0);  // defaults from the model's generation_config.json
     go->sp.min_p = (float)json_num(json_get(req, "min_p"), 0.0);
     go->sp.presence_penalty = (float)json_num(json_get(req, "presence_penalty"), 0);
     go->sp.frequency_penalty = (float)json_num(json_get(req, "frequency_penalty"), 0);

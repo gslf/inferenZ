@@ -1,5 +1,5 @@
-# Compare the engine's residual stream after every layer (INZ_DUMP_HIDDEN, float32 [L][T][10240]) with the
-# reference's (tests/ref_qwen38.py --dump-hidden, same layout). Prints, per layer, the relative L2 error per
+# Compare the engine's residual stream after every block (INZ_DUMP_HIDDEN, float32 [L][T][4096]) with the
+# reference's (tests/ref_nemotron.py --dump-hidden, same layout). Prints, per block, the relative L2 error per
 # token (mean and worst) and the cosine of the worst token: a bug shows up as a jump at the layer that has it.
 #
 #   python3 tests/compare_hidden.py ref_hidden.f32 eng_hidden.f32 T [CHUNK | n1,n2,...]
@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 
-W = 10240
+W = 4096
 ref = np.fromfile(sys.argv[1], dtype=np.float32)
 eng = np.fromfile(sys.argv[2], dtype=np.float32)
 T = int(sys.argv[3])
@@ -30,4 +30,4 @@ for l in range(L):
     rel = np.linalg.norm(e - r, axis=1) / np.maximum(np.linalg.norm(r, axis=1), 1e-30)
     w = int(rel.argmax())
     cos = float((r[w] * e[w]).sum() / max(np.linalg.norm(r[w]) * np.linalg.norm(e[w]), 1e-30))
-    print(f"layer {l:2d}  rel err mean {rel.mean():.2e}  max {rel.max():.2e} (token {w}, cos {cos:.6f})  |x| {np.linalg.norm(r, axis=1).mean():.1f}")
+    print(f"block {l:2d}  rel err mean {rel.mean():.2e}  max {rel.max():.2e} (token {w}, cos {cos:.6f})  |x| {np.linalg.norm(r, axis=1).mean():.1f}")

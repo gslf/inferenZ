@@ -1,4 +1,4 @@
-# inferenZ - single-model CPU inference engine for Qwen3.8-Flash-Next (Linux only)
+# inferenZ - single-model CPU inference engine for Nemotron 3.5 Super (Linux only)
 CC      ?= gcc
 ARCH    ?= -march=native
 CFLAGS  ?= -O3 $(ARCH) -std=gnu23 -fopenmp -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing -g

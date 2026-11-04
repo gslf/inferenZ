@@ -183,7 +183,7 @@ typedef struct {
 
 struct tokenizer {
     int n_vocab;
-    int split;            // pre-tokenizer: TOK_SPLIT_O200K or TOK_SPLIT_QWEN
+    int split;            // pre-tokenizer: TOK_SPLIT_*
     char **piece;
     uint32_t *plen;
     bool *special;
@@ -319,7 +319,8 @@ tokenizer *tok_load_hf_json(const char *path, char *err, size_t errlen) {
     jval *vocab = json_get(model, "vocab");
     jval *merges = json_get(model, "merges");
     jval *added = json_get(root, "added_tokens");
-    // pre-tokenizer flavour from the split regex (Qwen isolates single digits and joins letters with marks)
+    // pre-tokenizer flavour from the split regex (Qwen isolates single digits and joins letters with marks; Tekken
+    // isolates single digits and has no contractions)
     int split = TOK_SPLIT_O200K;
     {
         jval *pre = json_get(root, "pre_tokenizer");
@@ -327,8 +328,16 @@ tokenizer *tok_load_hf_json(const char *path, char *err, size_t errlen) {
         for (jval *x = list ? list->child : (pre ? pre : NULL); x; x = list ? x->next : NULL) {
             const char *rx = json_str(json_path(x, "pattern.Regex"), "");
             if (strstr(rx, "[\\p{L}\\p{M}]+|\\p{N}|")) split = TOK_SPLIT_QWEN;
+            if (strstr(rx, "[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?") && !strstr(rx, "'s")) split = TOK_SPLIT_TEKKEN;
             if (!list) break;
         }
+    }
+    {
+        const jval *norm = json_get(root, "normalizer");
+        const bool nfc = norm && norm->type == JOBJ && !strcmp(json_str(json_get(norm, "type"), ""), "NFC");
+        const bool ignore_merges = json_bool(json_path(root, "model.ignore_merges"), false);
+        if (split == TOK_SPLIT_TEKKEN && (nfc || !ignore_merges))
+            { snprintf(err, errlen, "tokenizer.json: Tekken split without ignore_merges, or with a normalizer"); json_free(root); return NULL; }
     }
     if (!vocab || !merges) { snprintf(err, errlen, "tokenizer.json: missing model.vocab/merges"); json_free(root); return NULL; }
     tokenizer *t = inz_calloc(1, sizeof(*t));
@@ -501,7 +510,7 @@ int tok_find(const tokenizer *t, const char *str) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Pre-tokenizer (o200k-style split, as in the MiniMax tokenizer.json) */
+/* Pre-tokenizers (o200k, Qwen and Tekken splits)                     */
 /* ------------------------------------------------------------------ */
 
 typedef struct { uint32_t cp; uint16_t f; uint32_t off; } ucp;
@@ -574,7 +583,10 @@ static int match_at_qwen(const ucp *u, int n, int i) {
     return i + 1;
 }
 
-static int match_at(const ucp *u, int n, int i) {
+// Tekken: the o200k split without contractions and with single digits
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+
+//   [\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+static int match_at_any(const ucp *u, int n, int i, bool tekken) {
     // alternatives 1 and 2 (letters with optional leading symbol)
     for (int alt = 1; alt <= 2; alt++) {
         for (int pre = 1; pre >= 0; pre--) {
@@ -587,7 +599,7 @@ static int match_at(const ucp *u, int n, int i) {
                     if (k < n && IS_B(u[k].f)) {
                         int e = k;
                         while (e < n && IS_B(u[e].f)) e++;
-                        return contraction(u, n, e);
+                        return tekken ? e : contraction(u, n, e);
                     }
                 }
             } else {
@@ -595,15 +607,15 @@ static int match_at(const ucp *u, int n, int i) {
                     int e = j;
                     while (e < n && IS_A(u[e].f)) e++;
                     while (e < n && IS_B(u[e].f)) e++;
-                    return contraction(u, n, e);
+                    return tekken ? e : contraction(u, n, e);
                 }
             }
         }
     }
-    // \p{N}{1,3}
+    // \p{N}{1,3} (Tekken: \p{N})
     if (u[i].f & UC_N) {
         int e = i;
-        while (e < n && e < i + 3 && (u[e].f & UC_N)) e++;
+        while (e < n && e < i + (tekken ? 1 : 3) && (u[e].f & UC_N)) e++;
         return e;
     }
     // ' ?[^\s\p{L}\p{N}]+[\r\n/]*'
@@ -703,9 +715,12 @@ static int bpe_word(tokenizer *t, const char *s, int n, int32_t *out) {
 }
 
 static int encode_chunk(tokenizer *t, const char *s, size_t len, int32_t *out, int cap, int count) {
-    // NFC normalize, split, BPE
+    // NFC normalize (not Tekken), split, BPE
+    const bool tekken = t->split == TOK_SPLIT_TEKKEN;
     char *norm;
-    size_t nl = inz_nfc(s, len, &norm);
+    size_t nl;
+    if (tekken) { norm = inz_malloc(len + 1); memcpy(norm, s, len); norm[len] = 0; nl = len; }
+    else nl = inz_nfc(s, len, &norm);
     ucp *u = inz_malloc(sizeof(ucp) * (nl + 1));
     int n = 0;
     for (size_t i = 0; i < nl;) {
@@ -720,7 +735,7 @@ static int encode_chunk(tokenizer *t, const char *s, size_t len, int32_t *out, i
     u[n].off = (uint32_t)nl;
     int32_t tmp_small[256];
     for (int i = 0; i < n;) {
-        int e = t->split == TOK_SPLIT_QWEN ? match_at_qwen(u, n, i) : match_at(u, n, i);
+        int e = t->split == TOK_SPLIT_QWEN ? match_at_qwen(u, n, i) : match_at_any(u, n, i, tekken);
         if (e <= i) e = i + 1;
         const char *ws = norm + u[i].off;
         int wl = (int)(u[e].off - u[i].off);
@@ -731,7 +746,8 @@ static int encode_chunk(tokenizer *t, const char *s, size_t len, int32_t *out, i
             for (uint32_t k = 0; k < ce->nids; k++) { if (count < cap) out[count] = ce->ids[k]; count++; }
         } else {
             int32_t *ids = wl <= 256 ? tmp_small : inz_malloc(sizeof(int32_t) * wl);
-            int nt = bpe_word(t, ws, wl, ids);
+            const int whole = tekken ? vfind(t, ws, (size_t)wl) : -1;  // ignore_merges: a known word stays whole
+            int nt = whole >= 0 ? (ids[0] = whole, 1) : bpe_word(t, ws, wl, ids);
             for (int k = 0; k < nt; k++) { if (count < cap) out[count] = ids[k]; count++; }
             if (wl <= 64) {
                 free(ce->key); free(ce->ids);

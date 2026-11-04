@@ -1,77 +1,65 @@
-# Qwen3.8-Flash-Next
+# Nemotron 3.5 Super
 
 [README](../README.md)
 
-The model has 125 billion parameters, but each token uses only about 6 billion of them. Most of the weights are *experts* that are consulted only when they are relevant. That is what lets a model this large run on a laptop: for each token, the engine only needs the small part of the model that the token uses.
+NVIDIA Nemotron 3.5 Super has 120 billion parameters, but each token uses only about 12 billion of them. Most of the weights are *experts* that are consulted only when they are relevant. That is what lets a model this large run on a laptop: for each token, the engine only needs the small part of the model that the token uses.
 
-A token goes through 48 layers. Each layer does two things:
-1. it looks at the earlier tokens, to bring in context;
-2. it transforms what it has gathered, with a few experts chosen for this token.
+inferenZ runs the language model of the official release, *Nemotron-3.5-Super-VL-120B-A12B*. The vision encoder of that release is not converted.
 
-At the end the model gives a score to each of the 248,320 tokens of its vocabulary, and one of them is picked.
+A token goes through 88 blocks. Every block reads the running state of the token (the *residual stream*), normalizes it, computes something and adds the result back. There are three kinds of blocks:
+1. 40 **Mamba-2** blocks bring in context through a memory of fixed size;
+2. 8 **attention** blocks bring in context by looking back at every earlier token;
+3. 40 **MoE** blocks transform the token with a few experts chosen for it.
+
+At the end the model gives a score to each of the 131,072 tokens of its vocabulary, and one of them is picked.
 
 ## Tokens in, tokens out
 
-A tokenizer splits the text into tokens. Each token starts as a list of 2,560 numbers looked up in a table (the *embedding*). After the last layer, the *LM head* turns the final numbers back into a score for every token of the vocabulary. The scores become probabilities, and the next token is drawn from them.
-
-## Four parallel streams
-
-In most models, each layer reads one running list of numbers (the *residual stream*), computes something, and adds its result back. Qwen3.8-Flash-Next keeps four of these streams side by side (*hyper-connections*).
-- Before each block, a small learned network decides how to blend the four streams into the block's input.
-- After the block, it decides how much of the result to add to each stream.
-
-The layers thus have more freedom in what they pass on to later layers, at a small cost. At the end, the four streams are blended into one.
+A tokenizer splits the text into tokens. Each token starts as a list of 4,096 numbers looked up in a table (the *embedding*). After the last block, the *LM head* turns the final numbers back into a score for every token of the vocabulary. The scores become probabilities, and the next token is drawn from them.
 
 ## Two ways of looking at the past
 
-To predict the next token the model must use what came before. Classic attention compares the current token with every earlier one. It´s precise, but its cost grows with the length of the text. This model combines two cheaper mechanisms.
+### Mamba-2: a compact memory (40 blocks)
 
-### Gated DeltaNet: a compact memory (36 layers)
-
-Three layers out of four keep a memory of fixed size instead of looking back at the tokens. The memory holds associations between *keys* (what something is about) and *values* (what to remember about it). For each new token:
-- the memory fades a little, more or less depending on the token (the *gate*), old details give way to new ones;
-- the model checks what the memory already says about the current key and writes in only the difference (the *delta rule*), so the same thing is not stored twice;
-- the token reads from the memory what it needs (its *query*).
+A Mamba-2 block keeps a memory of fixed size instead of looking back at the tokens. The memory has 128 heads; each head stores a 64 × 128 table. For each new token:
+- a short convolution mixes the token with the three before it;
+- the memory fades a little, more or less depending on the token (the *step size*);
+- the token writes into the memory what it carries, keyed by a 128-wide vector (*B*), and reads out what it needs with another one (*C*);
+- the output is normalized and gated by the token itself, then projected back.
 
 The cost per token is the same at token 10 as at token 100,000. The price is that the memory is a summary: it cannot quote an earlier passage word for word.
 
-### QSA: sparse attention (12 layers)
+### Attention (8 blocks)
 
-Every fourth layer uses real attention, which can retrieve exact earlier tokens. To keep it cheap, it does not read all of them. A small *indexer* groups the text into blocks of 4 tokens and scores how relevant each block is to the current token. Attention then reads only the 512 best blocks (2,048 tokens), plus the latest unfinished block. 
+Eight blocks, spread through the model, use real attention, which can retrieve exact earlier tokens. 32 query heads share 2 key/value heads, and there is no positional encoding: the Mamba blocks already know where a token is. Attention reads every earlier token, so its cost grows with the length of the text, but only 8 blocks pay it.
 
-Together, the DeltaNet layers carry the gist of a long text cheaply, and the QSA layers fetch exact details when they are needed.
+Together, the Mamba blocks carry the gist of a long text cheaply, and the attention blocks fetch exact details when they are needed.
 
-## Mixture of experts
+## Mixture of experts (LatentMoE)
 
-After looking at the context, each layer transforms the token with a feed-forward network. Instead of one large network, each layer has 512 small ones, the *experts*. A *router* picks the 10 best suited to the token and weights their answers. One more expert, the *shared expert*, is always used, for what every token needs.
+Each MoE block has 512 small networks, the *experts*. A *router* scores all of them for the token (a sigmoid per expert); the 22 best are chosen, and their answers are weighted by their scores. The experts do not work on the 4,096 numbers of the token directly: a projection first compresses the token to 1,024 numbers (the *latent*), the experts work there, and a second projection brings their weighted sum back to 4,096. One more network, the *shared expert*, always runs on the full token.
 
-The experts hold 121 of the 125 billion parameters, but a token uses only 10 of the 512 in each layer. This is why inferenZ can keep the experts on the SSD and only the ones in use in RAM ([STREAMING.md](STREAMING.md)).
-
-## The n-gram table
-
-Before its second layer, the model consults a very large table (320 million rows, 51 GB), indexed by the last two or three tokens. It works like a dictionary of short token sequences: what the model knows about common combinations is looked up instead of being computed. Any combination has a row, because the table is indexed by a hash of the tokens. A gate decides from the context how much of what was looked up to use. The lookup restarts at the end of a document, so it never mixes two unrelated texts.
-
-The table is huge, but each token reads only 16 small rows of it. inferenZ therefore leaves it on the SSD and lets the operating system keep the frequent rows in memory.
+The experts hold 113 of the 120 billion parameters, but a token uses only 22 of the 512 in each block. This is why inferenZ can keep the experts on the SSD and only the ones in use in RAM ([STREAMING.md](STREAMING.md)).
 
 ## MTP (speculative decoding)
 
-The model comes with one extra layer, trained to guess the token after the next one (*multi-token prediction*). inferenZ uses it to draft a token cheaply. The main model then checks the draft and produces its own next token in a single pass. When the draft is right (over 90% of the time in our tests), two tokens come out for little more than the cost of one. The output is exactly what the model would have written without the draft ([SPECULATIVE.md](SPECULATIVE.md)).
+The model comes with one extra attention block and one extra MoE block, trained to guess the token after the next one (*multi-token prediction*). inferenZ uses them to draft a token cheaply. The main model then checks the draft and produces its own next token in a single pass. When the draft is right, two tokens come out for little more than the cost of one. The output is exactly what the model would have written without the draft ([SPECULATIVE.md](SPECULATIVE.md)).
 
 ## In numbers
 
 | | |
 |---|---|
-| parameters | 125 B, 121 B of them in experts; about 6 B used per token |
-| plus | the n-gram table (51 B entries) and the MTP layer (4 B) |
-| layers | 48: 36 Gated DeltaNet and 12 QSA attention, plus the MTP layer |
-| numbers per token | 2,560, in 4 parallel streams |
-| experts | 512 per layer, 10 chosen per token, plus 1 shared |
-| vocabulary | 248,320 tokens |
+| parameters | 120 B, 113 B of them in experts; about 12 B used per token |
+| blocks | 88: 40 Mamba-2, 40 MoE, 8 attention, plus the MTP blocks |
+| numbers per token | 4,096 (1,024 inside the experts) |
+| experts | 512 per MoE block, 22 chosen per token, plus 1 shared |
+| vocabulary | 131,072 tokens |
 
 ## The official weights
 
-Qwen publishes the model as 184 GB of weights:
-- the experts and the n-gram table in FP8, numbers of 8 bits, with a scale factor for each block of weights;
+NVIDIA publishes the model in two precisions. inferenZ uses the NVFP4 release (75 GB), which NVIDIA trained by distillation from the BF16 weights and whose published benchmarks match them:
+- the experts and the shared experts in NVFP4: numbers of 4 bits, with a scale for every 16 of them;
+- the Mamba and attention projections and the LM head in FP8: numbers of 8 bits, with one scale per matrix;
 - everything else in BF16, numbers of 16 bits.
 
-inferenZ converts them once into its own file, choosing a format for each kind of tensor ([QUANTIZATION.md](QUANTIZATION.md)).
+inferenZ converts them once into its own file, keeping every number exactly as published ([QUANTIZATION.md](QUANTIZATION.md)).

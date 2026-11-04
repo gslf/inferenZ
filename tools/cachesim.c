@@ -23,7 +23,7 @@ typedef struct { uint32_t t; int32_t key; uint32_t ord; float w; } acc;  // w: n
 
 static acc *A;
 static size_t na, cap_a;
-static int n_layer = 0, n_expert = 512, nk;  // Qwen3.8-Flash-Next: 512 experts per layer (-e N to change)
+static int n_layer = 0, n_expert = 512, nk;  // Nemotron 3.5 Super: 512 experts per MoE block (-e N to change)
 
 static void push(uint32_t t, int32_t key) {
     if (na == cap_a) { cap_a = cap_a ? cap_a * 2 : 1 << 20; A = realloc(A, sizeof(acc) * cap_a); }

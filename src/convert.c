@@ -1,15 +1,19 @@
-// inz convert: official Qwen3.8-Flash-Next safetensors (FP8 repository: block-scaled E4M3 experts, BF16 rest)
-// -> inferenZ GGUF.
+// inz convert: the official Nemotron 3.5 Super VL NVFP4 checkpoint (modelopt mixed precision: NVFP4 experts and
+// shared experts, FP8 Mamba and attention projections and LM head, BF16 rest) -> inferenZ GGUF. The vision tower is
+// not converted: the engine runs the language model.
 //
-// The converter streams: it declares every tensor up front, then writes them in order, waiting for each
-// source tensor to finish downloading (tools/hfget.py journal) when needed. Routed experts are written as one
-// 4 KiB-aligned blob per expert (gate|up, down), so the runtime fetches a missed expert with one O_DIRECT read.
-// BF16 sources stored as F16 keep their exact values (BF16 has 7 mantissa bits, F16 has 10).
+// The converter streams: it declares every tensor up front, then writes them in order, waiting for each source
+// tensor to finish downloading (tools/hfget.py journal) when needed. By default every tensor keeps its exact
+// checkpoint values: NVFP4 is repacked as Q4N, FP8 copied as F8T, BF16 matrices stored as F16 (F16 has more
+// mantissa bits; only magnitudes below 6e-5 lose relative precision, by less than 3e-8 in absolute terms). Routed
+// experts are written as one 4 KiB-aligned blob per expert (up, down), so the runtime fetches a missed expert with
+// one O_DIRECT read.
 #define _GNU_SOURCE
 #include "convert.h"
 
 #include <math.h>
 #include <omp.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +26,8 @@
 #include "tokenizer.h"
 #include "util.h"
 
-#define SRC "model.language_model."
+#define SRC "language_model.backbone."
+#define SRC_MTP "language_model.mtp."
 
 /* ------------------------------------------------------------------ */
 /* Source decoding                                                     */
@@ -58,32 +63,56 @@ static uint8_t *read_all(st_model *m, const st_tensor *t) {
 }
 
 static float e4m3_lut[256];
+static const float k_e2m1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
 
-// Any float-like source tensor as f32. FP8 E4M3 weights are multiplied by their BF16 weight_scale_inv,
-// one per 128x128 block.
+// the per-tensor F32 scalar `<base>suffix` of a modelopt tensor `<base>weight`
+static float sibling_scalar(st_model *m, const char *weight_name, const char *suffix) {
+    char n[600];
+    const size_t bl = strlen(weight_name) - strlen("weight");
+    snprintf(n, sizeof(n), "%.*s%s", (int)bl, weight_name, suffix);
+    const st_tensor *t = need(m, "%s", n);
+    if (t->dtype != ST_F32 || st_numel(t) != 1) inz_die("convert: %s is not an F32 scalar", n);
+    float v;
+    if (!st_read(m, t, &v)) inz_die("convert: read failed for %s", n);
+    return v;
+}
+
+static const st_tensor *sibling(st_model *m, const char *weight_name, const char *suffix) {
+    char n[600];
+    const size_t bl = strlen(weight_name) - strlen("weight");
+    snprintf(n, sizeof(n), "%.*s%s", (int)bl, weight_name, suffix);
+    return need(m, "%s", n);
+}
+
+// Any source tensor as f32 [rows][cols]: BF16/F16/F32, FP8 with its per-tensor weight_scale, or NVFP4 (two e2m1
+// codes per byte, an e4m3 weight_scale per 16 inputs, a per-tensor weight_scale_2).
 static float *load(st_model *m, const char *name, int64_t *rows_out, int64_t *cols_out) {
     const st_tensor *t = need(m, "%s", name);
     const int64_t n = st_numel(t);
-    const int64_t rows = t->ndim >= 2 ? t->shape[0] : 1, cols = t->ndim >= 2 ? n / t->shape[0] : n;
+    int64_t rows = t->ndim >= 2 ? t->shape[0] : 1, cols = t->ndim >= 2 ? n / t->shape[0] : n;
     uint8_t *b = read_all(m, t);
-    float *f = inz_malloc(sizeof(float) * (size_t)n);
+    float *f;
     switch (t->dtype) {
-    case ST_F32: memcpy(f, b, sizeof(float) * (size_t)n); break;
-    case ST_BF16: for (int64_t i = 0; i < n; i++) f[i] = inz_bf16_to_f32(((uint16_t *)b)[i]); break;
-    case ST_F16: for (int64_t i = 0; i < n; i++) f[i] = inz_f16_to_f32(((uint16_t *)b)[i]); break;
+    case ST_F32: f = inz_malloc(sizeof(float) * (size_t)n); memcpy(f, b, sizeof(float) * (size_t)n); break;
+    case ST_BF16: f = inz_malloc(sizeof(float) * (size_t)n); for (int64_t i = 0; i < n; i++) f[i] = inz_bf16_to_f32(((uint16_t *)b)[i]); break;
+    case ST_F16: f = inz_malloc(sizeof(float) * (size_t)n); for (int64_t i = 0; i < n; i++) f[i] = inz_f16_to_f32(((uint16_t *)b)[i]); break;
     case ST_F8_E4M3: {
-        char sname[600];
-        snprintf(sname, sizeof(sname), "%s_scale_inv", name);
-        const st_tensor *st = st_find(m, sname);
-        float *sc = NULL;
-        int64_t sr = 1, scn = 1;
-        if (st) sc = load(m, sname, &sr, &scn);
-        const int64_t br = st ? (rows + sr - 1) / sr : rows, bc = st ? (cols + scn - 1) / scn : cols;
+        const float s = sibling_scalar(m, name, "weight_scale");
+        f = inz_malloc(sizeof(float) * (size_t)n);
+        for (int64_t i = 0; i < n; i++) f[i] = e4m3_lut[b[i]] * s;
+        break;
+    }
+    case ST_U8: {
+        const st_tensor *st = sibling(m, name, "weight_scale");
+        const float s2 = sibling_scalar(m, name, "weight_scale_2");
+        cols *= 2;
+        if (st->dtype != ST_F8_E4M3 || st_numel(st) != rows * cols / 16) inz_die("convert: %s has unexpected NVFP4 scales", name);
+        uint8_t *sc = read_all(m, st);
+        f = inz_malloc(sizeof(float) * (size_t)(rows * cols));
         for (int64_t r = 0; r < rows; r++)
             for (int64_t c = 0; c < cols; c++) {
-                float v = e4m3_lut[b[r * cols + c]];
-                if (sc) v *= sc[(r / br) * scn + c / bc];
-                f[r * cols + c] = v;
+                const uint8_t code = (b[(r * cols + c) / 2] >> ((c & 1) * 4)) & 15;
+                f[r * cols + c] = k_e2m1[code] * e4m3_lut[sc[(r * cols + c) / 16]] * s2;
             }
         free(sc);
         break;
@@ -144,17 +173,16 @@ static const float *imx_get(const char *name, int cols) {
 
 void convert_opts_default(convert_opts *o) {
     memset(o, 0, sizeof(*o));
-    o->t_dense = INZ_T_F16;
-    o->t_hc = INZ_T_F16;
-    o->t_shared = INZ_T_F16;
+    o->t_mamba = INZ_T_F8T;
+    o->t_attn = INZ_T_F8T;
+    o->t_shared = INZ_T_Q4N;
+    o->t_latent = INZ_T_F16;
     o->t_router = INZ_T_F16;
-    o->t_ple = INZ_T_F16;
-    o->t_experts = INZ_T_Q8G;
-    o->t_head = INZ_T_Q8G;
-    o->t_head_screen = 0;     // none: the exact head is read whole (--screen Q4L for the two-stage head)
-    o->t_embed = INZ_T_Q8G;
+    o->t_mtp = INZ_T_F16;
+    o->t_experts = INZ_T_Q4N;
+    o->t_head = INZ_T_F8T;
+    o->t_embed = INZ_T_F16;
     o->max_layers = Q_N_LAYER;
-    o->rot8 = true;
 }
 
 typedef struct {
@@ -177,7 +205,7 @@ static void declare_f32(cvt *c, const char *name, int n) {
 }
 
 uint64_t convert_expert_blob_bytes(int type) {
-    uint64_t b = mat_bytes(type, 2 * Q_FF, Q_H) + mat_bytes(type, Q_H, Q_FF);
+    uint64_t b = mat_bytes(type, Q_FF, Q_LAT) + mat_bytes(type, Q_LAT, Q_FF);
     return INZ_ALIGN_UP(b, 4096);
 }
 
@@ -185,54 +213,66 @@ static void put(cvt *c, const void *data, uint64_t n) {
     if (!gguf_w_data(c->w, data, n) || !gguf_w_tensor_done(c->w)) inz_die("convert: write failed");
 }
 
-// Encode W (rows x cols, f32) as `type` into out (mat_bytes bytes). rot8: Hadamard-rotate Q8G as well.
-// imp: optional per-column importance (mean squared input), which weights the quantization error.
-static void encode(const float *W, int rows, int cols, int type, bool rot8, int threads, const float *imp, void *out) {
+// Encode W (rows x cols, f32) as `type` into out (mat_bytes bytes). imp: optional per-column importance (mean squared
+// input), which weights the quantization error.
+static void encode(const float *W, int rows, int cols, int type, int threads, const float *imp, void *out) {
     if (type == INZ_T_F16) {
         uint16_t *h = out;
-        for (size_t i = 0; i < (size_t)rows * cols; i++) h[i] = inz_f32_to_f16(W[i]);
+        for (size_t i = 0; i < (size_t)rows * cols; i++) {
+            if (fabsf(W[i]) > 65504.0f) inz_die("convert: a weight (%g) overflows F16", W[i]);
+            h[i] = inz_f32_to_f16(W[i]);
+        }
         return;
     }
     if (type == INZ_T_F32) { memcpy(out, W, sizeof(float) * (size_t)rows * cols); return; }
-    inz_quant_params p = {.type = type, .rot_block = type == INZ_T_Q8G ? (rot8 ? inz_auto_rot_block(cols) : -1) : 0,
-                          .threads = threads, .imatrix = imp};
+    if (type == INZ_T_F8T) inz_die("convert: F8T keeps FP8 checkpoint tensors only");
+    inz_quant_params p = {.type = type, .rot_block = type == INZ_T_Q8G ? inz_auto_rot_block(cols) : 0, .threads = threads, .imatrix = imp};
     inz_quantize(W, rows, cols, &p, out);
 }
 
-// dst: the GGUF name (for the importance matrix)
-static void write_mat(cvt *c, const char *src, const char *dst, int type, int rows, int cols, bool rot8) {
+// Source tensor `src` as `type` into out. FP8 -> F8T and NVFP4 -> Q4N are exact copies; anything else goes
+// through f32. dst: the GGUF name (for the importance matrix).
+static void convert_mat(st_model *m, const char *src, const char *dst, int type, int rows, int cols, int threads, void *out) {
+    const st_tensor *t = need(m, "%s", src);
+    if (type == INZ_T_F8T && t->dtype == ST_F8_E4M3) {
+        if (t->ndim != 2 || t->shape[0] != rows || t->shape[1] != cols) inz_die("convert: %s is not %dx%d", src, rows, cols);
+        uint8_t *b = read_all(m, t);
+        for (int64_t i = 0; i < (int64_t)rows * cols; i++)
+            if ((b[i] & 0x7F) == 0x7F) inz_die("convert: %s holds a NaN", src);
+        inz_pack_f8t(b, sibling_scalar(m, src, "weight_scale"), rows, cols, out);
+        free(b);
+        return;
+    }
+    if (type == INZ_T_Q4N && t->dtype == ST_U8) {
+        if (t->ndim != 2 || t->shape[0] != rows || t->shape[1] * 2 != cols) inz_die("convert: %s is not %dx%d NVFP4", src, rows, cols);
+        const st_tensor *st = sibling(m, src, "weight_scale");
+        if (st->dtype != ST_F8_E4M3 || st_numel(st) != (int64_t)rows * cols / 16) inz_die("convert: %s has unexpected scales", src);
+        uint8_t *b = read_all(m, t), *sc = read_all(m, st);
+        if (!inz_pack_q4n_mul(b, sc, sibling_scalar(m, src, "weight_scale_2"), rows, cols, out))
+            inz_die("convert: %s has a negative or NaN block scale", src);
+        free(b);
+        free(sc);
+        return;
+    }
     int64_t r, cc;
-    float *W = load(c->m, src, &r, &cc);
+    float *W = load(m, src, &r, &cc);
     if (r * cc != (int64_t)rows * cols) inz_die("convert: %s has %lldx%lld, expected %dx%d", src, (long long)r, (long long)cc, rows, cols);
-    const uint64_t nb = mat_bytes(type, rows, cols);
-    void *buf = inz_aligned(64, nb);
-    encode(W, rows, cols, type, rot8, c->o->threads, imx_get(dst, cols), buf);
-    put(c, buf, nb);
-    free(buf);
+    encode(W, rows, cols, type, threads, imx_get(dst, cols), out);
     free(W);
 }
 
-// fuse two sources with the same input into one matrix (rows of a, then rows of b)
-static void write_fused(cvt *c, const char *sa, const char *sb, const char *dst, int type, int rows_each, int cols, bool rot8) {
-    int64_t r, cc;
-    float *A = load(c->m, sa, &r, &cc);
-    float *B = load(c->m, sb, &r, &cc);
-    float *AB = inz_malloc(sizeof(float) * 2 * (size_t)rows_each * cols);
-    memcpy(AB, A, sizeof(float) * (size_t)rows_each * cols);
-    memcpy(AB + (size_t)rows_each * cols, B, sizeof(float) * (size_t)rows_each * cols);
-    const uint64_t nb = mat_bytes(type, 2 * rows_each, cols);
+static void write_mat(cvt *c, const char *src, const char *dst, int type, int rows, int cols) {
+    const uint64_t nb = mat_bytes(type, rows, cols);
     void *buf = inz_aligned(64, nb);
-    encode(AB, 2 * rows_each, cols, type, rot8, c->o->threads, imx_get(dst, cols), buf);
+    convert_mat(c->m, src, dst, type, rows, cols, c->o->threads, buf);
     put(c, buf, nb);
-    free(buf); free(A); free(B); free(AB);
+    free(buf);
 }
 
-// small f32 tensor; zero_centered: the model multiplies by (1 + w), which is folded in here
-static void write_vec(cvt *c, const char *src, int n, bool zero_centered) {
+static void write_vec(cvt *c, const char *src, int n) {
     int64_t r, cc;
     float *f = load(c->m, src, &r, &cc);
     if (r * cc != n) inz_die("convert: %s has %lld elements, expected %d", src, (long long)(r * cc), n);
-    if (zero_centered) for (int i = 0; i < n; i++) f[i] += 1.0f;
     put(c, f, (uint64_t)n * 4);
     free(f);
 }
@@ -242,114 +282,70 @@ static void progress(cvt *c, const char *what) {
 }
 
 /* ------------------------------------------------------------------ */
-/* One decoder layer (the 48 of the model and the MTP layer)            */
+/* Blocks                                                              */
 /* ------------------------------------------------------------------ */
 
-static void declare_hc(cvt *c, const char *k, bool inject) {
-    char n[96];
-    snprintf(n, sizeof(n), "%s.norm", k); declare_f32(c, n, Q_HCW);
-    snprintf(n, sizeof(n), "%s.down", k); declare_mat(c, n, c->o->t_hc, Q_HC_RANK, Q_HCW);
-    snprintf(n, sizeof(n), "%s.up", k); declare_mat(c, n, c->o->t_hc, Q_HCW, Q_HC_RANK);
-    if (inject) { snprintf(n, sizeof(n), "%s.inject", k); declare_mat(c, n, INZ_T_F32, Q_HC, Q_HCW); }
-}
-
-// dst: "blk.N" or "mtp.blk"
-static void declare_block(cvt *c, const char *dst, bool attn, bool ple) {
+// dst: "blk.N", "mtp.at" or "mtp.moe"; t_attn: attention storage (FP8 in the model, BF16 in the MTP layer)
+static void declare_block(cvt *c, const char *dst, int kind, int t_attn) {
     const convert_opts *o = c->o;
     char n[96];
 #define D(suffix) (snprintf(n, sizeof(n), "%s." suffix, dst), n)
-    declare_hc(c, D("ahc"), true);
-    declare_hc(c, D("mhc"), true);
-    if (attn) {
-        declare_mat(c, D("at.q"), o->t_dense, Q_QPROJ, Q_H);
-        declare_mat(c, D("at.kv"), o->t_dense, 2 * Q_KV, Q_H);
-        declare_mat(c, D("at.idx"), o->t_dense, Q_IDX_PROJ, Q_H);
-        declare_mat(c, D("at.o"), o->t_dense, Q_H, Q_NH * Q_HD);
-        declare_f32(c, D("at.q_norm"), Q_HD);
-        declare_f32(c, D("at.k_norm"), Q_HD);
-        declare_f32(c, D("at.iq_norm"), Q_IDX_HD);
-        declare_f32(c, D("at.ik_norm"), Q_IDX_HD);
+    declare_f32(c, D("norm"), Q_H);
+    if (kind == QB_MAMBA) {
+        declare_mat(c, D("mb.in"), o->t_mamba, Q_MB_PROJ, Q_H);
+        declare_mat(c, D("mb.out"), o->t_mamba, Q_H, Q_MB_INNER);
+        declare_mat(c, D("mb.conv"), INZ_T_F32, Q_MB_CONV, Q_MB_KS);
+        declare_f32(c, D("mb.conv_bias"), Q_MB_CONV);
+        declare_f32(c, D("mb.A_log"), Q_MB_NH);
+        declare_f32(c, D("mb.D"), Q_MB_NH);
+        declare_f32(c, D("mb.dt_bias"), Q_MB_NH);
+        declare_f32(c, D("mb.norm"), Q_MB_INNER);
+    } else if (kind == QB_ATTN) {
+        declare_mat(c, D("at.q"), t_attn, Q_QD, Q_H);
+        declare_mat(c, D("at.k"), t_attn, Q_KV, Q_H);
+        declare_mat(c, D("at.v"), t_attn, Q_KV, Q_H);
+        declare_mat(c, D("at.o"), t_attn, Q_H, Q_QD);
     } else {
-        declare_mat(c, D("dn.qkv"), o->t_dense, Q_DN_CONV, Q_H);
-        declare_mat(c, D("dn.z"), o->t_dense, Q_DN_VAL, Q_H);
-        declare_mat(c, D("dn.ab"), INZ_T_F32, 2 * Q_DN_NV, Q_H);
-        declare_mat(c, D("dn.conv"), INZ_T_F32, Q_DN_CONV, Q_DN_KS);
-        declare_f32(c, D("dn.A_log"), Q_DN_NV);
-        declare_f32(c, D("dn.dt_bias"), Q_DN_NV);
-        declare_f32(c, D("dn.norm"), Q_DN_DV);
-        declare_mat(c, D("dn.out"), o->t_dense, Q_H, Q_DN_VAL);
+        declare_mat(c, D("router"), o->t_router, Q_N_EXPERT, Q_H);
+        declare_f32(c, D("router_bias"), Q_N_EXPERT);
+        declare_mat(c, D("lat_in"), o->t_latent, Q_LAT, Q_H);
+        declare_mat(c, D("lat_out"), o->t_latent, Q_H, Q_LAT);
+        declare_mat(c, D("sh.up"), o->t_shared, Q_SHARED_FF, Q_H);
+        declare_mat(c, D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF);
     }
-    declare_mat(c, D("router"), o->t_router, Q_N_EXPERT, Q_H);
-    declare_mat(c, D("sh.gate_up"), o->t_shared, 2 * Q_SHARED_FF, Q_H);
-    declare_mat(c, D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF);
-    declare_f32(c, D("sh.gate"), Q_H);
 #undef D
-    if (ple) {
-        declare_mat(c, "ple.key", o->t_ple, Q_HCW, Q_H);
-        declare_mat(c, "ple.value", o->t_ple, Q_H, Q_H);
-        declare_f32(c, "ple.norm_key", Q_HCW);
-        declare_f32(c, "ple.norm_query", Q_HCW);
-        declare_f32(c, "ple.norm_conv", Q_HCW);
-        declare_mat(c, "ple.conv", INZ_T_F32, Q_HCW, Q_PLE_CONV_K);
-    }
 }
 
-// src: the checkpoint prefix of the module ("model.language_model.layers.N." or "mtp.layers.0.")
-// dst: the GGUF prefix ("blk.N.ahc", "mixer", ...)
-static void write_hc(cvt *c, const char *src, const char *dst, bool inject) {
+// src: the checkpoint prefix of the block ("language_model.backbone.layers.N." or "language_model.mtp.layers.0.")
+static void write_block(cvt *c, const char *src, const char *dst, int kind, int t_attn) {
     const convert_opts *o = c->o;
     char n[256], d[96];
-    snprintf(n, sizeof(n), "%shc_norm.weight", src); write_vec(c, n, Q_HCW, true);
-    snprintf(n, sizeof(n), "%sinput_mix_weight_down.weight", src); snprintf(d, sizeof(d), "%s.down", dst);
-    write_mat(c, n, d, o->t_hc, Q_HC_RANK, Q_HCW, o->rot8);
-    snprintf(n, sizeof(n), "%sinput_mix_weight_up.weight", src); snprintf(d, sizeof(d), "%s.up", dst);
-    write_mat(c, n, d, o->t_hc, Q_HCW, Q_HC_RANK, o->rot8);
-    if (inject) { snprintf(n, sizeof(n), "%sblock_inject_weight.weight", src); write_mat(c, n, NULL, INZ_T_F32, Q_HC, Q_HCW, false); }
-}
-
-static void write_block(cvt *c, const char *src, const char *dst, bool attn, bool ple) {
-    const convert_opts *o = c->o;
-    char n[256], n2[256], d[96];
 #define S(suffix) (snprintf(n, sizeof(n), "%s" suffix, src), n)
-#define S2(suffix) (snprintf(n2, sizeof(n2), "%s" suffix, src), n2)
 #define D(suffix) (snprintf(d, sizeof(d), "%s." suffix, dst), d)
-    write_hc(c, S("attn_hyper_connection."), D("ahc"), true);
-    write_hc(c, S("mlp_hyper_connection."), D("mhc"), true);
-    if (attn) {
-        write_mat(c, S("self_attn.q_proj.weight"), D("at.q"), o->t_dense, Q_QPROJ, Q_H, o->rot8);
-        write_fused(c, S("self_attn.k_proj.weight"), S2("self_attn.v_proj.weight"), D("at.kv"), o->t_dense, Q_KV, Q_H, o->rot8);
-        write_mat(c, S("self_attn.indexer.index_qk_proj.weight"), D("at.idx"), o->t_dense, Q_IDX_PROJ, Q_H, o->rot8);
-        write_mat(c, S("self_attn.o_proj.weight"), D("at.o"), o->t_dense, Q_H, Q_NH * Q_HD, o->rot8);
-        write_vec(c, S("self_attn.q_norm.weight"), Q_HD, true);
-        write_vec(c, S("self_attn.k_norm.weight"), Q_HD, true);
-        write_vec(c, S("self_attn.indexer.q_layernorm.weight"), Q_IDX_HD, true);
-        write_vec(c, S("self_attn.indexer.k_layernorm.weight"), Q_IDX_HD, true);
+    write_vec(c, S("norm.weight"), Q_H);
+    if (kind == QB_MAMBA) {
+        write_mat(c, S("mixer.in_proj.weight"), D("mb.in"), o->t_mamba, Q_MB_PROJ, Q_H);
+        write_mat(c, S("mixer.out_proj.weight"), D("mb.out"), o->t_mamba, Q_H, Q_MB_INNER);
+        write_mat(c, S("mixer.conv1d.weight"), NULL, INZ_T_F32, Q_MB_CONV, Q_MB_KS);
+        write_vec(c, S("mixer.conv1d.bias"), Q_MB_CONV);
+        write_vec(c, S("mixer.A_log"), Q_MB_NH);
+        write_vec(c, S("mixer.D"), Q_MB_NH);
+        write_vec(c, S("mixer.dt_bias"), Q_MB_NH);
+        write_vec(c, S("mixer.norm.weight"), Q_MB_INNER);
+    } else if (kind == QB_ATTN) {
+        write_mat(c, S("mixer.q_proj.weight"), D("at.q"), t_attn, Q_QD, Q_H);
+        write_mat(c, S("mixer.k_proj.weight"), D("at.k"), t_attn, Q_KV, Q_H);
+        write_mat(c, S("mixer.v_proj.weight"), D("at.v"), t_attn, Q_KV, Q_H);
+        write_mat(c, S("mixer.o_proj.weight"), D("at.o"), t_attn, Q_H, Q_QD);
     } else {
-        write_mat(c, S("linear_attn.in_proj_qkv.weight"), D("dn.qkv"), o->t_dense, Q_DN_CONV, Q_H, o->rot8);
-        write_mat(c, S("linear_attn.in_proj_z.weight"), D("dn.z"), o->t_dense, Q_DN_VAL, Q_H, o->rot8);
-        // a | b fused and kept f32: they set every head's decay and update strength
-        write_fused(c, S("linear_attn.in_proj_a.weight"), S2("linear_attn.in_proj_b.weight"), NULL, INZ_T_F32, Q_DN_NV, Q_H, false);
-        write_mat(c, S("linear_attn.conv1d.weight"), NULL, INZ_T_F32, Q_DN_CONV, Q_DN_KS, false);
-        write_vec(c, S("linear_attn.A_log"), Q_DN_NV, false);
-        write_vec(c, S("linear_attn.dt_bias"), Q_DN_NV, false);
-        write_vec(c, S("linear_attn.norm.weight"), Q_DN_DV, false);
-        write_mat(c, S("linear_attn.out_proj.weight"), D("dn.out"), o->t_dense, Q_H, Q_DN_VAL, o->rot8);
-    }
-    write_mat(c, S("mlp.gate.weight"), D("router"), o->t_router, Q_N_EXPERT, Q_H, o->rot8);
-    write_fused(c, S("mlp.shared_expert.gate_proj.weight"), S2("mlp.shared_expert.up_proj.weight"), D("sh.gate_up"), o->t_shared,
-                Q_SHARED_FF, Q_H, o->rot8);
-    write_mat(c, S("mlp.shared_expert.down_proj.weight"), D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF, o->rot8);
-    write_vec(c, S("mlp.shared_expert_gate.weight"), Q_H, false);
-    if (ple) {
-        write_mat(c, S("ple.key_proj.weight"), "ple.key", o->t_ple, Q_HCW, Q_H, o->rot8);
-        write_mat(c, S("ple.value_proj.weight"), "ple.value", o->t_ple, Q_H, Q_H, o->rot8);
-        write_vec(c, S("ple.norm_key.weight"), Q_HCW, true);
-        write_vec(c, S("ple.norm_query.weight"), Q_HCW, true);
-        write_vec(c, S("ple.norm_conv.weight"), Q_HCW, true);
-        write_mat(c, S("ple.conv1d.weight"), NULL, INZ_T_F32, Q_HCW, Q_PLE_CONV_K, false);
+        write_mat(c, S("mixer.gate.weight"), D("router"), o->t_router, Q_N_EXPERT, Q_H);
+        write_vec(c, S("mixer.gate.e_score_correction_bias"), Q_N_EXPERT);
+        write_mat(c, S("mixer.fc1_latent_proj.weight"), D("lat_in"), o->t_latent, Q_LAT, Q_H);
+        write_mat(c, S("mixer.fc2_latent_proj.weight"), D("lat_out"), o->t_latent, Q_H, Q_LAT);
+        write_mat(c, S("mixer.shared_experts.up_proj.weight"), D("sh.up"), o->t_shared, Q_SHARED_FF, Q_H);
+        write_mat(c, S("mixer.shared_experts.down_proj.weight"), D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF);
     }
 #undef S
-#undef S2
 #undef D
 }
 
@@ -374,11 +370,12 @@ int convert_run(const convert_opts *o) {
     c.w = gguf_writer_new(o->out_path, 4096);
     if (!c.w) { fprintf(stderr, "inz convert: cannot create %s\n", o->out_path); return 1; }
     const int NL = o->max_layers > 0 && o->max_layers < Q_N_LAYER ? o->max_layers : Q_N_LAYER;
-    const bool with_ngram = NL > Q_PLE_LAYER && !o->no_ngram;
+    int n_moe = 0;
+    for (int l = 0; l < NL; l++) n_moe += q_kind(l) == QB_MOE;
 
     // ---------------- metadata ----------------
     gguf_w_str(c.w, "general.architecture", Q_ARCH);
-    gguf_w_str(c.w, "general.name", "Qwen3.8-Flash-Next (inferenZ)");
+    gguf_w_str(c.w, "general.name", "NVIDIA Nemotron 3.5 Super 120B-A12B (inferenZ)");
     gguf_w_str(c.w, "inz.version", INZ_VERSION);
     gguf_w_u32(c.w, "inz.n_layer", (uint32_t)NL);
     gguf_w_u32(c.w, "inz.n_layer_full", Q_N_LAYER);
@@ -387,11 +384,10 @@ int convert_run(const convert_opts *o) {
     gguf_w_u32(c.w, "inz.expert_type", (uint32_t)o->t_experts);
     gguf_w_u64(c.w, "inz.expert_blob_bytes", convert_expert_blob_bytes(o->t_experts));
     char recipe[256];
-    snprintf(recipe, sizeof(recipe), "dense=%s hc=%s shared=%s router=%s ple=%s experts=%s head=%s screen=%s embed=%s rot8=%d%s",
-             inz_qtype_name(o->t_dense), inz_qtype_name(o->t_hc), inz_qtype_name(o->t_shared), inz_qtype_name(o->t_router),
-             inz_qtype_name(o->t_ple), inz_qtype_name(o->t_experts), inz_qtype_name(o->t_head),
-             o->t_head_screen > 0 ? inz_qtype_name(o->t_head_screen) : "none", inz_qtype_name(o->t_embed), o->rot8,
-             o->imatrix ? " imatrix" : "");
+    snprintf(recipe, sizeof(recipe), "mamba=%s attn=%s shared=%s latent=%s router=%s mtp=%s experts=%s head=%s embed=%s%s",
+             inz_qtype_name(o->t_mamba), inz_qtype_name(o->t_attn), inz_qtype_name(o->t_shared), inz_qtype_name(o->t_latent),
+             inz_qtype_name(o->t_router), inz_qtype_name(o->t_mtp), inz_qtype_name(o->t_experts), inz_qtype_name(o->t_head),
+             inz_qtype_name(o->t_embed), o->imatrix ? " imatrix" : "");
     gguf_w_str(c.w, "inz.recipe", recipe);
     if (tmpl) gguf_w_str(c.w, "tokenizer.chat_template", tmpl);
     gguf_w_u32(c.w, "tokenizer.split", (uint32_t)tok_get_split(tok));
@@ -421,170 +417,102 @@ int convert_run(const convert_opts *o) {
     }
 
     // ---------------- declarations ----------------
-    // MTP: one more decoder layer (QSA + MoE) for speculative decoding, stored as "mtp.blk" (+ experts "mtp.experts")
-    const bool with_mtp = NL == Q_N_LAYER && st_find(m, "mtp.fc_embedding.weight");
+    // MTP: an attention block and a MoE block for speculative decoding ("mtp.*", experts "mtp.experts")
+    const bool with_mtp = NL == Q_N_LAYER && st_find(m, SRC_MTP "layers.0.eh_proj.weight");
     char name[256];
-#define DN(fmt, ...) (snprintf(name, sizeof(name), fmt, __VA_ARGS__), name)
     declare_mat(&c, "token_embd.weight", o->t_embed, Q_VOCAB, Q_H);
     declare_mat(&c, "output.weight", o->t_head, Q_VOCAB, Q_H);
-    if (o->t_head_screen > 0) declare_mat(&c, "output_screen.weight", o->t_head_screen, Q_VOCAB, Q_H);
-    declare_hc(&c, "mixer", false);
+    declare_f32(&c, "output_norm", Q_H);
     for (int l = 0; l < NL; l++) {
-        char blk[32];
-        snprintf(blk, sizeof(blk), "blk.%d", l);
-        declare_block(&c, blk, q_is_attn(l), l == Q_PLE_LAYER && with_ngram);
+        snprintf(name, sizeof(name), "blk.%d", l);
+        declare_block(&c, name, q_kind(l), o->t_attn);
     }
     if (with_mtp) {
-        declare_mat(&c, "mtp.fc_emb", o->t_dense, Q_H, Q_H);
-        declare_mat(&c, "mtp.fc_hid", o->t_dense, Q_H, Q_H);
-        declare_f32(&c, "mtp.norm_emb", Q_H);
-        declare_f32(&c, "mtp.norm_hid", Q_HCW);
-        declare_hc(&c, "mtp.mixer", false);
-        declare_block(&c, "mtp.blk", true, false);
+        declare_mat(&c, "mtp.eh", o->t_mtp, Q_H, 2 * Q_H);
+        declare_f32(&c, "mtp.enorm", Q_H);
+        declare_f32(&c, "mtp.hnorm", Q_H);
+        declare_f32(&c, "mtp.final_norm", Q_H);
+        declare_block(&c, "mtp.at", QB_ATTN, o->t_mtp);
+        declare_block(&c, "mtp.moe", QB_MOE, o->t_mtp);
         gguf_w_u32(c.w, "inz.mtp_layers", Q_MTP_LAYERS);
-    }
-    // n-gram table: contiguous shards of raw FP8 rows
-    int ng_shards = 0;
-    if (with_ngram) {
-        uint64_t ng_rows = 0;
-        for (;; ng_shards++) {
-            const st_tensor *t = st_find(m, DN(SRC "layers.%d.ple.ple_embedding.ngram_embedding.shard_%d.weight", Q_PLE_LAYER, ng_shards));
-            if (!t) break;
-            if (t->dtype != ST_F8_E4M3 || t->shape[1] != Q_NG_DIM) inz_die("convert: unexpected n-gram shard %s", t->name);
-            ng_rows += (uint64_t)t->shape[0];
-        }
-        gguf_w_u32(c.w, "inz.ngram_shards", (uint32_t)ng_shards);
-        uint64_t ne[2] = {Q_NG_DIM, ng_rows};
-        gguf_w_tensor(c.w, "ngram.table", INZ_T_FP8, 2, ne, ng_rows * Q_NG_DIM);
-        declare_f32(&c, "ngram.scale", 1);  // FP8Embedding: every row is multiplied by this per-tensor scale
     }
     // experts last: they arrive last from the download and dominate the file
     const uint64_t blob = convert_expert_blob_bytes(o->t_experts);
-    for (int l = 0; l <= NL; l++) {
-        if (l == NL && !with_mtp) break;
+    for (int k = 0; k <= n_moe; k++) {
+        if (k == n_moe && !with_mtp) break;
         uint64_t ne[2] = {blob, Q_N_EXPERT};
-        gguf_w_tensor(c.w, l < NL ? DN("blk.%d.experts", l) : "mtp.experts", INZ_T_EXPERTS, 2, ne, blob * Q_N_EXPERT);
+        if (k < n_moe) snprintf(name, sizeof(name), "moe.%d.experts", k);
+        else snprintf(name, sizeof(name), "mtp.experts");
+        gguf_w_tensor(c.w, name, INZ_T_EXPERTS, 2, ne, blob * Q_N_EXPERT);
     }
     if (!gguf_w_header(c.w)) inz_die("convert: header write failed");
     progress(&c, "header written");
 
     // ---------------- data ----------------
-    {
-        // embeddings and head are row-addressed at runtime: never rotated
-        int64_t r, cc;
-        float *E = load(m, SRC "embed_tokens.weight", &r, &cc);
-        void *buf = inz_aligned(64, mat_bytes(o->t_embed, Q_VOCAB, Q_H));
-        encode(E, Q_VOCAB, Q_H, o->t_embed, false, o->threads, NULL, buf);
-        put(&c, buf, mat_bytes(o->t_embed, Q_VOCAB, Q_H));
-        free(buf);
-        free(E);
-        float *Hd = load(m, "lm_head.weight", &r, &cc);
-        buf = inz_aligned(64, mat_bytes(o->t_head, Q_VOCAB, Q_H));
-        encode(Hd, Q_VOCAB, Q_H, o->t_head, false, o->threads, imx_get("output.weight", Q_H), buf);
-        put(&c, buf, mat_bytes(o->t_head, Q_VOCAB, Q_H));
-        free(buf);
-        if (o->t_head_screen > 0) {
-            buf = inz_aligned(64, mat_bytes(o->t_head_screen, Q_VOCAB, Q_H));
-            encode(Hd, Q_VOCAB, Q_H, o->t_head_screen, false, o->threads, imx_get("output.weight", Q_H), buf);
-            put(&c, buf, mat_bytes(o->t_head_screen, Q_VOCAB, Q_H));
-            free(buf);
-        }
-        free(Hd);
-        progress(&c, "embeddings and head");
-    }
-    write_hc(&c, SRC "hyper_connection_mixer.", "mixer", false);
+    write_mat(&c, SRC "embeddings.weight", NULL, o->t_embed, Q_VOCAB, Q_H);
+    write_mat(&c, "language_model.lm_head.weight", "output.weight", o->t_head, Q_VOCAB, Q_H);
+    write_vec(&c, SRC "norm_f.weight", Q_H);
+    progress(&c, "embeddings and head");
     for (int l = 0; l < NL; l++) {
         char src[128], dst[32];
         snprintf(src, sizeof(src), SRC "layers.%d.", l);
         snprintf(dst, sizeof(dst), "blk.%d", l);
-        write_block(&c, src, dst, q_is_attn(l), l == Q_PLE_LAYER && with_ngram);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "layer %d dense part", l);
-        progress(&c, msg);
+        write_block(&c, src, dst, q_kind(l), o->t_attn);
+        if (l % 8 == 7 || l == NL - 1) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "blocks 0-%d dense part", l);
+            progress(&c, msg);
+        }
     }
     if (with_mtp) {
-        write_mat(&c, "mtp.fc_embedding.weight", "mtp.fc_emb", o->t_dense, Q_H, Q_H, o->rot8);
-        write_mat(&c, "mtp.fc_hidden.weight", "mtp.fc_hid", o->t_dense, Q_H, Q_H, o->rot8);
-        write_vec(&c, "mtp.pre_fc_norm_embedding.weight", Q_H, true);
-        write_vec(&c, "mtp.pre_fc_norm_hidden.weight", Q_HCW, true);
-        write_hc(&c, "mtp.hyper_connection_mixer.", "mtp.mixer", false);
-        write_block(&c, "mtp.layers.0.", "mtp.blk", true, false);
+        write_mat(&c, SRC_MTP "layers.0.eh_proj.weight", "mtp.eh", o->t_mtp, Q_H, 2 * Q_H);
+        write_vec(&c, SRC_MTP "layers.0.enorm.weight", Q_H);
+        write_vec(&c, SRC_MTP "layers.0.hnorm.weight", Q_H);
+        write_vec(&c, SRC_MTP "layers.1.final_layernorm.weight", Q_H);
+        write_block(&c, SRC_MTP "layers.0.", "mtp.at", QB_ATTN, o->t_mtp);
+        write_block(&c, SRC_MTP "layers.1.", "mtp.moe", QB_MOE, o->t_mtp);
         progress(&c, "MTP dense part");
-    }
-    if (with_ngram) {
-        // the runtime recomputes the hashing parameters: check them against the checkpoint's buffers
-        int64_t mult[3], prime[Q_NG_HEADS], offset[Q_NG_HEADS];
-        q_ngram_params(mult, prime, offset);
-        static const char *buf_name[3] = {"layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"};
-        const int64_t *want[3] = {mult, prime, offset};
-        const int want_n[3] = {3, Q_NG_HEADS, Q_NG_HEADS};
-        for (int b = 0; b < 3; b++) {
-            const st_tensor *t = need(m, SRC "layers.%d.ple.ple_embedding.%s", Q_PLE_LAYER, buf_name[b]);
-            if (t->dtype != ST_I64 || st_numel(t) != want_n[b]) inz_die("convert: unexpected %s", t->name);
-            int64_t *v = (int64_t *)read_all(m, t);
-            for (int i = 0; i < want_n[b]; i++)
-                if (v[i] != want[b][i]) inz_die("convert: n-gram %s[%d] = %lld, expected %lld", buf_name[b], i, (long long)v[i], (long long)want[b][i]);
-            free(v);
-        }
-        for (int s = 0; s < ng_shards; s++) {
-            const st_tensor *t = need(m, SRC "layers.%d.ple.ple_embedding.ngram_embedding.shard_%d.weight", Q_PLE_LAYER, s);
-            uint8_t *b = read_all(m, t);
-            if (!gguf_w_data(c.w, b, t->nbytes)) inz_die("convert: write failed");
-            free(b);
-            if (s % 16 == 15) {
-                char msg[64];
-                snprintf(msg, sizeof(msg), "n-gram table %d/%d shards", s + 1, ng_shards);
-                progress(&c, msg);
-            }
-        }
-        if (!gguf_w_tensor_done(c.w)) inz_die("convert: write failed");
-        write_vec(&c, SRC "layers.1.ple.ple_embedding.ngram_embedding.weight_scale", 1, false);
     }
 
     // ---------------- experts ----------------
     const int et = o->t_experts;
-    const uint64_t b_gu = mat_bytes(et, 2 * Q_FF, Q_H);
+    const uint64_t b_up = mat_bytes(et, Q_FF, Q_LAT);
     uint8_t *layer_buf = inz_aligned(4096, blob * Q_N_EXPERT);
-    for (int l = 0; l <= NL; l++) {
-        if (l == NL && !with_mtp) break;
+    for (int k = 0, l = 0; k <= n_moe; k++) {
+        if (k == n_moe && !with_mtp) break;
         char base[128], dbase[32];
-        if (l < NL) snprintf(base, sizeof(base), SRC "layers.%d.mlp.experts.", l);
-        else snprintf(base, sizeof(base), "mtp.layers.0.mlp.experts.");
-        if (l < NL) snprintf(dbase, sizeof(dbase), "blk.%d.experts.", l);
-        else snprintf(dbase, sizeof(dbase), "mtp.experts.");
+        if (k < n_moe) {
+            while (q_kind(l) != QB_MOE) l++;
+            snprintf(base, sizeof(base), SRC "layers.%d.mixer.experts.", l++);
+            snprintf(dbase, sizeof(dbase), "moe.%d.experts.", k);
+        } else {
+            snprintf(base, sizeof(base), SRC_MTP "layers.1.mixer.experts.");
+            snprintf(dbase, sizeof(dbase), "mtp.experts.");
+        }
         // wait for the whole layer first (the reads below run in parallel)
-        static const char *nm[3] = {"gate_proj", "up_proj", "down_proj"};
+        static const char *nm[2] = {"up_proj", "down_proj"};
         for (int e = 0; e < Q_N_EXPERT; e++)
-            for (int w = 0; w < 3; w++) {
+            for (int w = 0; w < 2; w++) {
                 need(m, "%s%d.%s.weight", base, e, nm[w]);
-                need(m, "%s%d.%s.weight_scale_inv", base, e, nm[w]);
+                need(m, "%s%d.%s.weight_scale", base, e, nm[w]);
+                need(m, "%s%d.%s.weight_scale_2", base, e, nm[w]);
             }
         memset(layer_buf, 0, blob * Q_N_EXPERT);
         int nthreads = o->threads > 0 ? o->threads : omp_get_max_threads();
         #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1)
         for (int e = 0; e < Q_N_EXPERT; e++) {
-            char nb[512];
-            int64_t r, cc;
-            snprintf(nb, sizeof(nb), "%s%d.gate_proj.weight", base, e);
-            float *G = load(m, nb, &r, &cc);
-            snprintf(nb, sizeof(nb), "%s%d.up_proj.weight", base, e);
-            float *U = load(m, nb, &r, &cc);
-            snprintf(nb, sizeof(nb), "%s%d.down_proj.weight", base, e);
-            float *D = load(m, nb, &r, &cc);
-            float *GU = inz_malloc(sizeof(float) * 2 * Q_FF * Q_H);
-            memcpy(GU, G, sizeof(float) * Q_FF * Q_H);
-            memcpy(GU + (size_t)Q_FF * Q_H, U, sizeof(float) * Q_FF * Q_H);
-            uint8_t *dst = layer_buf + (size_t)e * blob;
-            char in1[64], in2[64];
-            snprintf(in1, sizeof(in1), "%s%d.gate_up", dbase, e);
-            snprintf(in2, sizeof(in2), "%s%d.down", dbase, e);
-            encode(GU, 2 * Q_FF, Q_H, et, o->rot8, 1, imx_get(in1, Q_H), dst);
-            encode(D, Q_H, Q_FF, et, o->rot8, 1, imx_get(in2, Q_FF), dst + b_gu);
-            free(G); free(U); free(D); free(GU);
+            char src[512], dst[64];
+            uint8_t *out = layer_buf + (size_t)e * blob;
+            snprintf(src, sizeof(src), "%s%d.up_proj.weight", base, e);
+            snprintf(dst, sizeof(dst), "%s%d.up", dbase, e);
+            convert_mat(m, src, dst, et, Q_FF, Q_LAT, 1, out);
+            snprintf(src, sizeof(src), "%s%d.down_proj.weight", base, e);
+            snprintf(dst, sizeof(dst), "%s%d.down", dbase, e);
+            convert_mat(m, src, dst, et, Q_LAT, Q_FF, 1, out + b_up);
         }
         put(&c, layer_buf, blob * Q_N_EXPERT);
         char msg[64];
-        if (l < NL) snprintf(msg, sizeof(msg), "layer %d experts (%.2f MiB/expert)", l, blob / 1048576.0);
+        if (k < n_moe) snprintf(msg, sizeof(msg), "MoE block %d experts (%.2f MiB/expert)", k, blob / 1048576.0);
         else snprintf(msg, sizeof(msg), "MTP experts");
         progress(&c, msg);
     }

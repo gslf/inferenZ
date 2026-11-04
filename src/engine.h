@@ -1,4 +1,4 @@
-// Public runtime API of the inferenZ engine (one model: Qwen3.8-Flash-Next).
+// Public runtime API of the inferenZ engine (one model: Nemotron 3.5 Super).
 #ifndef INZ_ENGINE_H
 #define INZ_ENGINE_H
 
@@ -21,7 +21,6 @@ typedef struct {
     bool mlock;
     bool spec;                  // MTP speculative decoding (when the model has the MTP layer)
     int spec_k;                 // draft tokens per step (1..3)
-    bool exact_head;            // ignore the screening head: full exact LM head in RAM (validation)
     int lookahead;              // decode: prefetch the experts the next layer's router predicts (0 = off)
     const char *hotlist;        // expert warm-start scores file: path, "auto" or "off"
     const char *route_trace;    // write routing trace for offline cache simulation (optional)
@@ -38,7 +37,7 @@ tokenizer *engine_tokenizer(inz_engine *e);
 const char *engine_model_name(inz_engine *e);
 const char *engine_chat_template(inz_engine *e);
 int engine_eos(inz_engine *e);      // <|im_end|>: end of an assistant turn
-int engine_eot(inz_engine *e);      // <|endoftext|>
+int engine_eot(inz_engine *e);      // </s>
 
 typedef struct {
     sampler_params sp;
@@ -60,7 +59,7 @@ typedef bool (*gen_cb)(void *ud, int token);
 
 // Generate a continuation of `prompt`. The engine keeps the state of the previous call and reuses the longest
 // common token prefix it can (chat clients resend the whole history): the attention cache is positional, and the
-// recurrent DeltaNet state is checkpointed before the last prompt token of every request.
+// recurrent Mamba-2 state is checkpointed before the last prompt token of every request.
 int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const gen_opts *g, gen_cb cb, void *ud,
                     gen_result *res);
 

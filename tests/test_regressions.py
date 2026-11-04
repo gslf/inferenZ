@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Model-free checks of sampling, head selection and streamed stop strings."""
+"""Model-free checks of sampling and streamed stop strings."""
 from pathlib import Path
 import os
 import shlex
@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SAMPLER = r'''
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <assert.h>
 #include "sampler.h"
 static float values[257];
@@ -43,32 +44,22 @@ int main(void) {
     int32_t h[] = {0, 0};
     sampler_dist(&s, l, h, 2, &ix, &pr);
     printf("repeat_logit %g\n", l[0]);
+    // top-p without top-k: the nucleus must be the one of a full sort (exact probabilities over the vocabulary)
+    s.p.temperature = 0.8f; s.p.top_k = 0; s.p.top_p = 0.95f; s.p.repeat_penalty = 1;
+    for (int i = 0; i < 10000; i++) l[i] = (float)((i * 7919) % 1000) / 100.0f;
+    int c = sampler_dist(&s, l, NULL, 0, &ix, &pr);
+    int *all = malloc(sizeof(int) * 10000);
+    topk_f32(l, 10000, 0, all);
+    double z = 0, acc = 0;
+    for (int i = 0; i < 10000; i++) z += exp((l[i] - l[all[0]]) / 0.8);
+    int cref = 0;
+    while (cref < 10000) { acc += exp((l[all[cref]] - l[all[0]]) / 0.8) / z; cref++; if (acc >= 0.95) break; }
+    int same = c == cref;
+    for (int i = 0; i < c && same; i++) same = ix[i] == all[i];
+    printf("nucleus %d\n", same ? c : -c);
+    printf("nucleus_ref %d\n", cref);
+    free(all);
     sampler_free(&s); free(l);
-    return 0;
-}
-'''
-
-HEAD = r'''
-#include <fcntl.h>
-#include <assert.h>
-#include "model_fwd.c"
-int main(void) {
-    inz_engine *e = calloc(1, sizeof(*e));
-    float *l = calloc(Q_VOCAB, sizeof(float));
-    float x[Q_H] = {0};
-    e->tp = tp_create(1, NULL);
-    e->head.type = INZ_T_F16;
-    e->head_fd = open("/dev/zero", O_RDONLY);
-    if (e->head_fd < 0) return 2;
-    for (int i = 1; i < Q_VOCAB; i++) l[i] = -2;
-    head_rescore(e, x, l);
-    for (int i = 0; i < Q_VOCAB; i++) l[i] = 0;
-    l[Q_VOCAB - 1] = 0.001f;
-    head_rescore(e, x, l);
-    assert(l[Q_VOCAB - 1] == 0);
-    assert(e->head_cands <= 2 * HEAD_MAX_CAND);
-    puts("returned");
-    close(e->head_fd); tp_destroy(e->tp); free(l); free(e);
     return 0;
 }
 '''
@@ -183,13 +174,7 @@ def main():
         check("top_k=1 keeps global maximum", int(values["winner"]), 9999)
         check("repeat penalty applies once per token ID", float(values["repeat_logit"]), 2.0)
 
-        h = build("head", HEAD, ["quant.c", "threadpool.c", "util.c", "sampler.c"])
-        try:
-            subprocess.run([h], check=True, capture_output=True, text=True, timeout=3)
-        except subprocess.TimeoutExpired:
-            check("head candidate selection terminates", "timeout", "returned")
-        else:
-            check("head candidate selection terminates", "returned", "returned")
+        check("top_p without top_k is the full-sort nucleus", int(values["nucleus"]), int(values["nucleus_ref"]))
 
         s = build("stop", STOP, ["tokenizer.c", "chat.c", "json.c", "util.c"])
         out = subprocess.run([s], check=True, capture_output=True, text=True, timeout=10)

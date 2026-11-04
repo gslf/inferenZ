@@ -32,6 +32,7 @@ enum {
     INZ_T_Q8G = 103,    // int8 symmetric, 8.25 bpw
     INZ_T_Q3P = 106,    // 3-bit LUT, planar "Matryoshka": 2-bit coarse plane + scales first, 1-bit fine plane last
     INZ_T_Q4N = 107,    // NVFP4 repacked exactly: 4-bit e2m1 codes, one e4m3 scale per 16, per-tensor scale (4.5 bpw)
+    INZ_T_F8T = 108,    // FP8 copied exactly: e4m3 weights with one per-tensor scale (8 bpw), f32 activations
     INZ_T_FP8 = 110,    // raw e4m3 bytes without scales (row-gathered tables, e.g. the n-gram embedding)
     INZ_T_EXPERTS = 120 // per-layer packed routed experts (see model.h)
 };
@@ -63,13 +64,18 @@ typedef struct {
     const uint8_t *f;     // Q3P: fine plane (8 bytes per group), rows * ngroups * 8
     bool coarse;          // Q3P: fine plane absent -> decode with the 4-level coarse LUT (lut[8..11])
     const uint8_t *s8;    // Q4N: e4m3 scales, rows * ngroups * 4 (one per 16 weights)
-    float gscale;         // Q4N: weight = (lut[code] - 64) * e4m3 * gscale
+    float gscale;         // Q4N: weight = (lut[code] - 64) * e4m3 * gscale; F8T: weight = e4m3 * gscale
 } inz_qmat;
 
 // Q4N: repack an NVFP4 tensor (compressed-tensors layout: two e2m1 codes per byte, low nibble first; one e4m3
-// scale per 16 inputs; w = e2m1 * scale / global) without changing any value. Returns false when a scale is not
-// a positive normal e4m3 number (the kernels decode scales with two integer ops that assume it).
+// scale per 16 inputs; w = e2m1 * scale / global) without changing any value. Returns false when a scale is
+// negative or NaN (zero and subnormal scales are exact).
 bool inz_pack_q4n(const uint8_t *packed, const uint8_t *scales, float global_scale, int rows, int cols, void *out);
+
+// Q4N from a modelopt NVFP4 tensor: w = e2m1 * scale * scale_2 (the per-tensor factor multiplies).
+bool inz_pack_q4n_mul(const uint8_t *packed, const uint8_t *scales, float scale_2, int rows, int cols, void *out);
+// F8T: e4m3 bytes (row-major) with the per-tensor scale of a modelopt FP8 tensor (w = e4m3 * scale).
+void inz_pack_f8t(const uint8_t *w, float scale, int rows, int cols, void *out);
 
 // Q3P helpers: bytes of the coarse part (indices + scales) and of the fine plane, excluding the header.
 size_t inz_q3p_coarse_bytes(int rows, int cols);
@@ -132,6 +138,9 @@ void inz_act_quantize(inz_act *a, const float *x, int n, int rot_block, uint32_t
 
 // y[r] = W[r] . x for rows [r0, r1)
 void inz_matvec_rows(const inz_qmat *m, const inz_act *a, float *y, int r0, int r1);
+// F8T (f32 activations): rows [r0, r1) of one or n tokens; matvec and matmul give bit-identical rows
+void inz_matvec_f8t_rows(const inz_qmat *m, const float *x, float *y, int r0, int r1);
+void inz_matmul_f8t_rows(const inz_qmat *m, const float *X, int ldx, int n, float *Y, int ldy, int r0, int r1);
 // float32 / f16 / bf16 matvec for small dense tensors
 void inz_matvec_f32_rows(const float *W, int cols, const float *x, float *y, int r0, int r1);
 void inz_matvec_bf16_rows(const uint16_t *W, int cols, const float *x, float *y, int r0, int r1);

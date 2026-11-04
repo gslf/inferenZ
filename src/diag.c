@@ -15,7 +15,7 @@
 diag_state g_diag;
 
 static const char *stage_names[DG_N_STAGES] = {
-    "embed", "attn_norm", "attn_qkv", "attn_index", "attn_core", "attn_out", "ffn_norm", "router",
+    "embed", "mixer_norm", "attention", "attn_index", "mamba", "attn_out", "moe_norm", "router",
     "prefetch", "expert_hit", "expert_wait", "expert_miss", "shared_expert", "dense_ffn", "lm_head",
     "sample", "draft", "verify_extra", "other"};
 
@@ -33,7 +33,7 @@ static double measure_tsc_hz(void) {
     return (double)(c1 - c0) / (t1 - t0);
 }
 
-void diag_init(int n_layers, int n_experts, int topk) {
+void diag_init(int n_blocks, int n_layers, int n_experts, int topk) {
     free(g_diag.sel_hist);
     free(g_diag.prev_sel);
     free(g_diag.prev_valid);
@@ -42,6 +42,7 @@ void diag_init(int n_layers, int n_experts, int topk) {
     g_diag.peak_ram_gbs = ram;
     g_diag.peak_ssd_gbs = ssd;
     g_diag.tsc_hz = measure_tsc_hz();
+    g_diag.n_blocks = n_blocks < DIAG_MAX_LAYERS ? n_blocks : DIAG_MAX_LAYERS;
     g_diag.n_layers = n_layers;
     g_diag.n_experts = n_experts;
     g_diag.topk = topk;
@@ -292,7 +293,7 @@ void diag_write_json(jw *w) {
     // per-layer: time share of attention / experts / wait
     jw_key(w, "layers");
     jw_arr(w);
-    for (int l = 0; l < g_diag.n_layers && l < DIAG_MAX_LAYERS; l++) {
+    for (int l = 0; l < g_diag.n_blocks; l++) {
         double attn = 0, exp_ = 0, wait = 0, other = 0;
         for (int s = 0; s < DG_N_STAGES; s++) {
             double sec = (double)g_diag.layer[l][s].cycles / hz;

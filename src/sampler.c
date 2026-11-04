@@ -149,10 +149,24 @@ int sampler_dist(sampler *s, float *logits, const int32_t *hist, int nh, const i
         return 1;
     }
     const float inv_t = 1.0f / p->temperature;
-    int c = topk_f32(logits, s->vocab, p->top_k, s->idx);
+    int c;
+    double Z = 0;  // without top-k: the partition function over the whole vocabulary, so top-p is exact
+    if (p->top_k > 0 || !(p->top_p > 0 && p->top_p < 1.0f)) c = topk_f32(logits, s->vocab, p->top_k, s->idx);
+    else {
+        // the nucleus is found by growing a partial sort until it holds top_p of the probability mass
+        const float m0 = logits[argmax_f32(logits, s->vocab)];
+        for (int i = 0; i < s->vocab; i++) Z += expf((logits[i] - m0) * inv_t);
+        for (int k = 256;; k *= 4) {
+            c = topk_f32(logits, s->vocab, k, s->idx);
+            double acc = 0;
+            for (int i = 0; i < c; i++) acc += expf((logits[s->idx[i]] - m0) * inv_t);
+            if (acc >= p->top_p * Z || c == s->vocab) break;
+        }
+    }
     float m = logits[s->idx[0]];
     double sum = 0;
     for (int i = 0; i < c; i++) { s->prob[i] = expf((logits[s->idx[i]] - m) * inv_t); sum += s->prob[i]; }
+    if (Z > 0) sum = Z;  // m is the same maximum, so Z is on the same scale
     for (int i = 0; i < c; i++) s->prob[i] = (float)(s->prob[i] / sum);
     if (p->min_p > 0) {
         float th = s->prob[0] * p->min_p;

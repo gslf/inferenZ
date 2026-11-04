@@ -16,7 +16,7 @@
 
 void inz_opts_default(inz_opts *o) {
     memset(o, 0, sizeof(*o));
-    o->model_path = "models/qwen3.8-flash-next-q4q8.inz.gguf";  // the recommended recipe (README)
+    o->model_path = "models/nemotron-3.5-super.inz.gguf";  // the official NVFP4/FP8 weights (README)
     o->ctx = 32768;
     o->ram_reserve_gb = 0;    // auto: max(10 GB, 30% of RAM)
     o->cache_decay = 0.01f;
@@ -90,17 +90,11 @@ static int build_tokenizer(inz_engine *e) {
 /* ------------------------------------------------------------------ */
 
 // Dense tensors are copied into one anonymous arena so the page cache can be dropped and the OS never evicts
-// weights that every token needs. Routed experts, the embedding table and the n-gram table stay in the file.
+// weights that every token needs. Routed experts and the embedding table stay in the file.
 typedef struct { const gguf_tensor *t; size_t off; } dense_item;
 typedef struct { inz_engine *e; dense_item *items; int n; } dense_set;
 
-static bool resident(const gguf_file *g, const gguf_tensor *t, bool exact_head) {
-    if (t->type == INZ_T_EXPERTS || !strcmp(t->name, "token_embd.weight") || !strcmp(t->name, "ngram.table")) return false;
-    const bool screen = gguf_find_tensor(g, "output_screen.weight") != NULL;
-    if (!strcmp(t->name, "output_screen.weight")) return !exact_head;
-    if (!strcmp(t->name, "output.weight")) return exact_head || !screen;  // two-stage: exact rows read on demand
-    return true;
-}
+static bool resident(const gguf_tensor *t) { return t->type != INZ_T_EXPERTS && strcmp(t->name, "token_embd.weight"); }
 
 static const uint8_t *dense(const dense_set *d, const char *fmt, int l, const gguf_tensor **tout) {
     char name[128];
@@ -130,56 +124,41 @@ static void dlin(const dense_set *d, lin *m, const char *fmt, int l, int rows, i
     if (d->e->imx_path) m->imx = q_imx_register(d->e, t->name, cols);
 }
 
-static void bind_hc(const dense_set *d, hcw *w, const char *prefix, bool inject) {
-    char f[64];
-    snprintf(f, sizeof(f), "%s.norm", prefix);
-    w->norm = dvec(d, f, 0, Q_HCW);
-    snprintf(f, sizeof(f), "%s.down", prefix);
-    dlin(d, &w->down, f, 0, Q_HC_RANK, Q_HCW);
-    snprintf(f, sizeof(f), "%s.up", prefix);
-    dlin(d, &w->up, f, 0, Q_HCW, Q_HC_RANK);
-    w->inject = NULL;
-    if (inject) {
-        snprintf(f, sizeof(f), "%s.inject", prefix);
-        w->inject = dvec(d, f, 0, (uint64_t)Q_HC * Q_HCW);
-    }
-}
-
-// one decoder layer: "blk.N" or "mtp.blk"
-static void bind_block(const dense_set *d, q_layer *L, const char *pfx, bool attn) {
+// one block: "blk.N" or "mtp.at" / "mtp.moe"
+static void bind_block(const dense_set *d, q_layer *L, const char *pfx, int kind, int idx) {
     char f[64];
 #define N(suffix) (snprintf(f, sizeof(f), "%s." suffix, pfx), f)
-    bind_hc(d, &L->ahc, N("ahc"), true);
-    bind_hc(d, &L->mhc, N("mhc"), true);
-    if (attn) {
-        dlin(d, &L->at_q, N("at.q"), 0, Q_QPROJ, Q_H);
-        dlin(d, &L->at_kv, N("at.kv"), 0, 2 * Q_KV, Q_H);
-        dlin(d, &L->at_idx, N("at.idx"), 0, Q_IDX_PROJ, Q_H);
-        dlin(d, &L->at_o, N("at.o"), 0, Q_H, Q_NH * Q_HD);
-        L->q_norm = dvec(d, N("at.q_norm"), 0, Q_HD);
-        L->k_norm = dvec(d, N("at.k_norm"), 0, Q_HD);
-        L->iq_norm = dvec(d, N("at.iq_norm"), 0, Q_IDX_HD);
-        L->ik_norm = dvec(d, N("at.ik_norm"), 0, Q_IDX_HD);
+    L->kind = kind;
+    L->idx = idx;
+    L->norm = dvec(d, N("norm"), 0, Q_H);
+    if (kind == QB_MAMBA) {
+        dlin(d, &L->mb_in, N("mb.in"), 0, Q_MB_PROJ, Q_H);
+        dlin(d, &L->mb_out, N("mb.out"), 0, Q_H, Q_MB_INNER);
+        L->mb_conv = dvec(d, N("mb.conv"), 0, (uint64_t)Q_MB_CONV * Q_MB_KS);
+        L->mb_conv_b = dvec(d, N("mb.conv_bias"), 0, Q_MB_CONV);
+        const float *A_log = dvec(d, N("mb.A_log"), 0, Q_MB_NH);
+        for (int h = 0; h < Q_MB_NH; h++) L->mb_negA[h] = -expf(A_log[h]);
+        L->mb_D = dvec(d, N("mb.D"), 0, Q_MB_NH);
+        L->mb_dt = dvec(d, N("mb.dt_bias"), 0, Q_MB_NH);
+        L->mb_norm = dvec(d, N("mb.norm"), 0, Q_MB_INNER);
+    } else if (kind == QB_ATTN) {
+        dlin(d, &L->at_q, N("at.q"), 0, Q_QD, Q_H);
+        dlin(d, &L->at_k, N("at.k"), 0, Q_KV, Q_H);
+        dlin(d, &L->at_v, N("at.v"), 0, Q_KV, Q_H);
+        dlin(d, &L->at_o, N("at.o"), 0, Q_H, Q_QD);
     } else {
-        dlin(d, &L->dn_qkv, N("dn.qkv"), 0, Q_DN_CONV, Q_H);
-        dlin(d, &L->dn_z, N("dn.z"), 0, Q_DN_VAL, Q_H);
-        dlin(d, &L->dn_out, N("dn.out"), 0, Q_H, Q_DN_VAL);
-        L->dn_ab = dvec(d, N("dn.ab"), 0, 2ull * Q_DN_NV * Q_H);
-        L->dn_conv = dvec(d, N("dn.conv"), 0, (uint64_t)Q_DN_CONV * Q_DN_KS);
-        const float *A_log = dvec(d, N("dn.A_log"), 0, Q_DN_NV);
-        for (int h = 0; h < Q_DN_NV; h++) L->dn_negA[h] = -expf(A_log[h]);
-        L->dn_dt = dvec(d, N("dn.dt_bias"), 0, Q_DN_NV);
-        L->dn_norm = dvec(d, N("dn.norm"), 0, Q_DN_DV);
+        dlin(d, &L->router, N("router"), 0, Q_N_EXPERT, Q_H);
+        L->router_bias = dvec(d, N("router_bias"), 0, Q_N_EXPERT);
+        dlin(d, &L->lat_in, N("lat_in"), 0, Q_LAT, Q_H);
+        dlin(d, &L->lat_out, N("lat_out"), 0, Q_H, Q_LAT);
+        dlin(d, &L->sh_up, N("sh.up"), 0, Q_SHARED_FF, Q_H);
+        dlin(d, &L->sh_down, N("sh.down"), 0, Q_H, Q_SHARED_FF);
     }
-    dlin(d, &L->router, N("router"), 0, Q_N_EXPERT, Q_H);
-    dlin(d, &L->sh_gu, N("sh.gate_up"), 0, 2 * Q_SHARED_FF, Q_H);
-    dlin(d, &L->sh_down, N("sh.down"), 0, Q_H, Q_SHARED_FF);
-    L->sh_gate = dvec(d, N("sh.gate"), 0, Q_H);
 #undef N
 }
 
 // Recipe studies: INZ_OVERRIDE="other.gguf:pattern1,pattern2" takes the dense tensors whose name contains a
-// pattern from another conversion of the same model (e.g. exact DeltaNet projections into a 4-bit recipe).
+// pattern from another conversion of the same model (e.g. exact Mamba projections into a 4-bit recipe).
 static gguf_file *g_ovr;
 static char g_ovr_pat[16][32];
 static int g_n_ovr;
@@ -220,7 +199,7 @@ static void load_dense(inz_engine *e) {
     size_t total = 0;
     for (uint64_t i = 0; i < g->n_tensors; i++) {
         const gguf_tensor *t = &g->tensors[i];
-        if (!resident(g, t, e->opt.exact_head)) continue;
+        if (!resident(t)) continue;
         const gguf_tensor *o = g_ovr ? override_of(t) : NULL;
         d.items[d.n].t = o ? o : t;
         d.items[d.n].off = total;
@@ -249,68 +228,26 @@ static void load_dense(inz_engine *e) {
     if (e->opt.mlock && mlock(e->dense_mem, total) != 0) LOGI("mlock of dense weights failed (RLIMIT_MEMLOCK); continuing");
     LOGI("dense weights: %.2f GiB loaded in %.1f s", total / 1073741824.0, inz_now() - t0);
 
-    bind_hc(&d, &e->mixer, "mixer", false);
+    int count[256] = {0};
     for (int l = 0; l < e->n_layer; l++) {
         char pfx[16];
         snprintf(pfx, sizeof(pfx), "blk.%d", l);
-        bind_block(&d, &e->L[l], pfx, q_is_attn(l));
+        const int kind = q_kind(l);
+        bind_block(&d, &e->L[l], pfx, kind, count[kind]++);
     }
+    e->n_moe = count[QB_MOE];
+    e->norm_f = dvec(&d, "output_norm", 0, Q_H);
+    dlin(&d, &e->head, "output.weight", 0, Q_VOCAB, Q_H);
     q_mtp *M = &e->mtp;
-    M->present = gguf_find_tensor(g, "mtp.fc_emb") != NULL;
+    M->present = gguf_find_tensor(g, "mtp.eh") != NULL;
     if (M->present) {
-        dlin(&d, &M->fc_emb, "mtp.fc_emb", 0, Q_H, Q_H);
-        dlin(&d, &M->fc_hid, "mtp.fc_hid", 0, Q_H, Q_H);
-        M->norm_emb = dvec(&d, "mtp.norm_emb", 0, Q_H);
-        M->norm_hid = dvec(&d, "mtp.norm_hid", 0, Q_HCW);
-        bind_hc(&d, &M->mixer, "mtp.mixer", false);
-        bind_block(&d, &M->L, "mtp.blk", true);
+        dlin(&d, &M->eh, "mtp.eh", 0, Q_H, 2 * Q_H);
+        M->enorm = dvec(&d, "mtp.enorm", 0, Q_H);
+        M->hnorm = dvec(&d, "mtp.hnorm", 0, Q_H);
+        M->final_norm = dvec(&d, "mtp.final_norm", 0, Q_H);
+        bind_block(&d, &M->at, "mtp.at", QB_ATTN, Q_N_ATTN);
+        bind_block(&d, &M->moe, "mtp.moe", QB_MOE, e->n_moe);
         LOGI("MTP layer loaded: speculative decoding available");
-    }
-    if (gguf_find_tensor(g, "output_screen.weight") && !e->opt.exact_head) {
-        // two-stage head: the screen in RAM, exact rows from the file (page cache) for the candidates only
-        dlin(&d, &e->head_screen, "output_screen.weight", 0, Q_VOCAB, Q_H);
-        const gguf_tensor *t = gguf_find_tensor(g, "output.weight");
-        e->two_stage = true;
-        e->head_fd = open(g->path, O_RDONLY);
-        e->head_off = g->data_offset + t->offset;
-        e->head.type = (int)t->type;
-        e->head.rows = Q_VOCAB;
-        e->head.cols = Q_H;
-        if (t->type != INZ_T_F16) {
-            if (pread(e->head_fd, &e->head_hdr, sizeof(e->head_hdr), (off_t)e->head_off) != (ssize_t)sizeof(e->head_hdr) ||
-                !inz_qmat_view(&e->head.q, &e->head_hdr) || e->head.q.rot_block)
-                inz_die("model: output.weight must be F16 or an unrotated quantized matrix");
-        }
-        e->head_sigma = 0.5;
-        LOGI("two-stage LM head: %s screen in RAM, exact %s rows on demand", inz_qtype_name(e->head_screen.type),
-             inz_qtype_name(e->head.type));
-    } else {
-        dlin(&d, &e->head, "output.weight", 0, Q_VOCAB, Q_H);
-    }
-    // per-layer n-gram embedding: projections in RAM, the 51 GB table mapped from the file
-    const gguf_tensor *tab = gguf_find_tensor(g, "ngram.table");
-    q_ple *P = &e->ple;
-    P->present = tab && e->n_layer > Q_PLE_LAYER;
-    if (P->present) {
-        dlin(&d, &P->key, "ple.key", 0, Q_HCW, Q_H);
-        dlin(&d, &P->value, "ple.value", 0, Q_H, Q_H);
-        P->norm_key = dvec(&d, "ple.norm_key", 0, Q_HCW);
-        P->norm_query = dvec(&d, "ple.norm_query", 0, Q_HCW);
-        P->norm_conv = dvec(&d, "ple.norm_conv", 0, Q_HCW);
-        P->conv = dvec(&d, "ple.conv", 0, (uint64_t)Q_HCW * Q_PLE_CONV_K);
-        P->scale = dvec(&d, "ngram.scale", 0, 1)[0];
-        P->table = tab->data;
-        P->rows = tab->ne[1];
-        q_ngram_params(P->mult, P->prime, P->offset);
-        if (P->offset[Q_NG_HEADS - 1] + P->prime[Q_NG_HEADS - 1] > (int64_t)P->rows || tab->ne[0] != Q_NG_DIM)
-            inz_die("model: n-gram table has %llu rows, the hashing needs %lld", (unsigned long long)P->rows,
-                    (long long)(P->offset[Q_NG_HEADS - 1] + P->prime[Q_NG_HEADS - 1]));
-        // 16 random 160-byte rows per token: no readahead
-        const uintptr_t a = (uintptr_t)P->table & ~(uintptr_t)4095;
-        madvise((void *)a, (size_t)((uintptr_t)P->table + tab->nbytes - a), MADV_RANDOM);
-        LOGI("n-gram table: %.1f GiB mapped (%llu rows, scale %.3g)", tab->nbytes / 1073741824.0, (unsigned long long)P->rows, P->scale);
-    } else if (e->n_layer > Q_PLE_LAYER) {
-        inz_die("model: the n-gram table is missing (converted with --no-ngram?)");
     }
     free(d.items);
 }
@@ -329,22 +266,23 @@ static void setup_embed(inz_engine *e) {
     if (pread(e->embed_fd, e->embed_hdr, sizeof(inz_qhdr), (off_t)e->embed_offset) != (ssize_t)sizeof(inz_qhdr))
         inz_die("model: cannot read embedding header");
     // geometry only: q/d offsets relative to the header locate rows for pread
-    if (!inz_qmat_view(&e->embed, e->embed_hdr) || e->embed.rows != Q_VOCAB || e->embed.cols != Q_H || e->embed.rot_block)
-        inz_die("model: token_embd.weight must be an unrotated quantized %dx%d matrix", Q_VOCAB, Q_H);
+    if (!inz_qmat_view(&e->embed, e->embed_hdr) || e->embed.rows != Q_VOCAB || e->embed.cols != Q_H || e->embed.rot_block ||
+        e->embed.type == INZ_T_Q4N || e->embed.type == INZ_T_F8T)
+        inz_die("model: token_embd.weight must be F16 or an unrotated %dx%d matrix with one scale per group", Q_VOCAB, Q_H);
 }
 
 static void setup_experts(inz_engine *e, uint64_t other_bytes) {
     gguf_file *g = e->g;
-    e->expert_type = (int)gguf_get_int(g, "inz.expert_type", INZ_T_Q8G);
+    e->expert_type = (int)gguf_get_int(g, "inz.expert_type", INZ_T_Q4N);
     e->blob_bytes = (uint64_t)gguf_get_int(g, "inz.expert_blob_bytes", 0);
-    e->gu_bytes = inz_mat_bytes(e->expert_type, 2 * Q_FF, Q_H);
-    if (e->gu_bytes + inz_mat_bytes(e->expert_type, Q_H, Q_FF) > e->blob_bytes || e->blob_bytes % 4096)
+    e->up_bytes = inz_mat_bytes(e->expert_type, Q_FF, Q_LAT);
+    if (e->up_bytes + inz_mat_bytes(e->expert_type, Q_LAT, Q_FF) > e->blob_bytes || e->blob_bytes % 4096)
         inz_die("model: expert blob size %llu does not fit type %s", (unsigned long long)e->blob_bytes, inz_qtype_name(e->expert_type));
-    const int nl = e->n_layer + (e->mtp.present ? 1 : 0);  // the MTP layer's experts are layer n_layer
+    const int nl = e->n_moe + (e->mtp.present ? 1 : 0);  // the MTP layer's experts are layer n_moe
     uint64_t *off = inz_malloc(sizeof(uint64_t) * (size_t)nl * Q_N_EXPERT);
     for (int l = 0; l < nl; l++) {
         char name[64];
-        if (l < e->n_layer) snprintf(name, sizeof(name), "blk.%d.experts", l);
+        if (l < e->n_moe) snprintf(name, sizeof(name), "moe.%d.experts", l);
         else snprintf(name, sizeof(name), "mtp.experts");
         const gguf_tensor *t = gguf_find_tensor(g, name);
         if (!t || t->nbytes < e->blob_bytes * Q_N_EXPERT) inz_die("model: missing or short %s", name);
@@ -403,27 +341,23 @@ static void setup_experts(inz_engine *e, uint64_t other_bytes) {
 /* Sequence state                                                      */
 /* ------------------------------------------------------------------ */
 
-static const size_t S_FLOATS = (size_t)Q_N_DN * Q_DN_NV * Q_DN_DK * Q_DN_DV;
-static const size_t CONV_FLOATS = (size_t)Q_N_DN * (Q_DN_KS - 1) * Q_DN_CONV;
-static const size_t PLE_FLOATS = 9 * (size_t)Q_HCW;
-#define N_ATT (Q_N_ATTN + 1)  // the model's QSA layers + the MTP layer
+static const size_t S_FLOATS = (size_t)Q_N_MAMBA * Q_MB_NH * Q_MB_HD * Q_MB_DS;
+static const size_t CONV_FLOATS = (size_t)Q_N_MAMBA * (Q_MB_KS - 1) * Q_MB_CONV;
+#define N_ATT (Q_N_ATTN + 1)  // the model's attention blocks + the MTP layer
 
 static void rec_alloc(q_state *q) {
     q->S = inz_mmap_anon(S_FLOATS * 4, true);
     q->conv = inz_mmap_anon(CONV_FLOATS * 4, false);
-    q->ple_conv = inz_mmap_anon(PLE_FLOATS * 4, false);
 }
 
 static void rec_free(q_state *q) {
     inz_munmap(q->S, S_FLOATS * 4);
     inz_munmap(q->conv, CONV_FLOATS * 4);
-    inz_munmap(q->ple_conv, PLE_FLOATS * 4);
 }
 
 static void rec_copy(q_state *dst, const q_state *src) {
     memcpy(dst->S, src->S, S_FLOATS * 4);
     memcpy(dst->conv, src->conv, CONV_FLOATS * 4);
-    memcpy(dst->ple_conv, src->ple_conv, PLE_FLOATS * 4);
 }
 
 static void state_alloc(inz_engine *e) {
@@ -433,16 +367,14 @@ static void state_alloc(inz_engine *e) {
     // pages are touched lazily: an unused context or MTP layer costs no memory
     st->k = inz_mmap_anon((size_t)N_ATT * ctx * Q_KV * 2, true);
     st->v = inz_mmap_anon((size_t)N_ATT * ctx * Q_KV * 2, true);
-    st->ik = inz_mmap_anon((size_t)N_ATT * ctx * Q_IDX_HD * 4, true);
-    st->bk = inz_mmap_anon((size_t)N_ATT * (ctx / Q_IDX_BLOCK) * Q_IDX_HD * 4, true);
     rec_alloc(&e->ck);
     for (int i = 0; i < Q_SPEC_MAX; i++) rec_alloc(&e->snap[i]);
-    e->ck_x = inz_aligned(64, sizeof(float) * Q_HCW);
-    e->x_last = inz_aligned(64, sizeof(float) * Q_HCW);
-    e->Xm = inz_aligned(64, sizeof(float) * (size_t)Q_MAX_T * Q_HCW);
+    e->ck_x = inz_aligned(64, sizeof(float) * Q_H);
+    e->x_last = inz_aligned(64, sizeof(float) * Q_H);
+    e->Xm = inz_aligned(64, sizeof(float) * (size_t)Q_MAX_T * Q_H);
     e->ck_pos = -1;
     e->hist = inz_malloc(sizeof(int32_t) * ctx);
-    e->state_bytes = (2 + Q_SPEC_MAX) * (S_FLOATS + CONV_FLOATS + PLE_FLOATS) * 4 + (size_t)N_ATT * ctx * (2 * Q_KV * 2 + Q_IDX_HD * 4 + Q_IDX_HD);
+    e->state_bytes = (2 + Q_SPEC_MAX) * (S_FLOATS + CONV_FLOATS) * 4 + (size_t)N_ATT * ctx * 2 * Q_KV * 2;
 }
 
 static void state_free(inz_engine *e) {
@@ -451,8 +383,6 @@ static void state_free(inz_engine *e) {
     rec_free(st);
     inz_munmap(st->k, (size_t)N_ATT * ctx * Q_KV * 2);
     inz_munmap(st->v, (size_t)N_ATT * ctx * Q_KV * 2);
-    inz_munmap(st->ik, (size_t)N_ATT * ctx * Q_IDX_HD * 4);
-    inz_munmap(st->bk, (size_t)N_ATT * (ctx / Q_IDX_BLOCK) * Q_IDX_HD * 4);
     rec_free(&e->ck);
     for (int i = 0; i < Q_SPEC_MAX; i++) rec_free(&e->snap[i]);
     free(e->ck_x);
@@ -465,13 +395,13 @@ static void state_free(inz_engine *e) {
 // the recurrent state is not, so it is saved before the last prompt token and restored to rewind.
 static void checkpoint_save(inz_engine *e) {
     rec_copy(&e->ck, &e->st);
-    memcpy(e->ck_x, e->x_last, sizeof(float) * Q_HCW);
+    memcpy(e->ck_x, e->x_last, sizeof(float) * Q_H);
     e->ck_pos = e->n_past;
 }
 
 static void checkpoint_restore(inz_engine *e) {
     rec_copy(&e->st, &e->ck);
-    memcpy(e->x_last, e->ck_x, sizeof(float) * Q_HCW);
+    memcpy(e->x_last, e->ck_x, sizeof(float) * Q_H);
     e->n_past = e->ck_pos;
     // MTP slot p needs the token at p + 1: slots from ck_pos - 1 on are recomputed
     if (e->mtp_valid > e->ck_pos - 1) e->mtp_valid = e->ck_pos > 0 ? e->ck_pos - 1 : 0;
@@ -504,7 +434,7 @@ inz_engine *engine_open(const inz_opts *o, char *err, size_t errlen) {
     e->opt.hotlist = hotlist_path(o->hotlist, o->model_path, e->g->size);
     e->imx_path = getenv("INZ_IMATRIX");
     if (e->imx_path && !*e->imx_path) e->imx_path = NULL;
-    snprintf(e->model_name, sizeof(e->model_name), "qwen3.8-flash-next");
+    snprintf(e->model_name, sizeof(e->model_name), "nemotron-3.5-super");
     e->chat_template = gguf_get_str(e->g, "tokenizer.chat_template", NULL);
     if (build_tokenizer(e) != 0) { snprintf(err, errlen, "tokenizer metadata missing"); gguf_close(e->g); free(e); return NULL; }
     // threads: P + E cores by default (LP-E cores serve I/O and HTTP)
@@ -521,23 +451,23 @@ inz_engine *engine_open(const inz_opts *o, char *err, size_t errlen) {
         for (int i = topo.n_cpu - 1; i >= 0; i--) if (topo.cpu_class[i] == 2) { e->opt.sqpoll_cpu = topo.cpu_id[i]; break; }
     }
     diag_probe_ram(e->tp);
-    diag_init(Q_N_LAYER + 1, Q_N_EXPERT, Q_TOPK);  // + the MTP layer
+    diag_init(Q_N_LAYER + 2, Q_N_MOE + 1, Q_N_EXPERT, Q_TOPK);  // + the MTP blocks; routing per MoE block
     if (o->route_trace) g_diag.route_trace = fopen(o->route_trace, "w");
     LOGI("RAM bandwidth probe: %.1f GB/s", g_diag.peak_ram_gbs);
     load_dense(e);
     setup_embed(e);
-    e->ctx = o->ctx > 0 ? (o->ctx + Q_IDX_BLOCK - 1) / Q_IDX_BLOCK * Q_IDX_BLOCK : 32768;
+    e->ctx = o->ctx > 0 ? o->ctx : 32768;
     state_alloc(e);
     q_scratch_alloc(e);
     q_state_reset(e);
     if (e->imx_path) {
-        const size_t nl = (size_t)e->n_layer + (e->mtp.present ? 1 : 0);
-        e->imx_exp = inz_calloc(nl * Q_N_EXPERT * (Q_H + Q_FF), sizeof(double));
+        const size_t nl = (size_t)e->n_moe + (e->mtp.present ? 1 : 0);
+        e->imx_exp = inz_calloc(nl * Q_N_EXPERT * (Q_LAT + Q_FF), sizeof(double));
         e->imx_exp_n = inz_calloc(nl * Q_N_EXPERT, sizeof(uint64_t));
         LOGI("imatrix: collecting input statistics into %s", e->imx_path);
     }
     // state pages are touched lazily; budget the full context so the cache never starves long chats
-    setup_experts(e, e->state_bytes + (2ull << 30) + (e->imx_path ? (uint64_t)Q_N_LAYER * Q_N_EXPERT * (Q_H + Q_FF) * 8 : 0));
+    setup_experts(e, e->state_bytes + (2ull << 30) + (e->imx_path ? (uint64_t)(Q_N_MOE + 1) * Q_N_EXPERT * (Q_LAT + Q_FF) * 8 : 0));
     e->t_loaded = inz_now();
     e->state = "idle";
     return e;
@@ -552,7 +482,6 @@ void engine_close(inz_engine *e) {
     state_free(e);
     inz_munmap(e->dense_mem, e->dense_bytes);
     if (e->embed_fd > 0) close(e->embed_fd);
-    if (e->head_fd > 0) close(e->head_fd);
     free(e->embed_hdr);
     tok_free(e->tok);
     tp_destroy(e->tp);
@@ -594,16 +523,16 @@ static void mtp_fill(inz_engine *e, int p0, int n, const float *x_prev) {
     }
     float *X = e->Xm;
     int m = 0;
-    if (p0 > 0) memcpy(X + (size_t)m++ * Q_HCW, x_prev, sizeof(float) * Q_HCW);
-    memcpy(X + (size_t)m * Q_HCW, e->X, sizeof(float) * Q_HCW * (size_t)(n - 1));
+    if (p0 > 0) memcpy(X + (size_t)m++ * Q_H, x_prev, sizeof(float) * Q_H);
+    memcpy(X + (size_t)m * Q_H, e->X, sizeof(float) * Q_H * (size_t)(n - 1));
     m += n - 1;
-    q_mtp_forward(e, X, Q_HCW, e->hist + first + 1, m, first, NULL, 0, NULL);
+    q_mtp_forward(e, X, Q_H, true, e->hist + first + 1, m, first, NULL, 0, NULL);
     e->mtp_valid = last;
 }
 
 // one main forward of tokens at e->n_past with MTP bookkeeping
 static void forward_tracked(inz_engine *e, const int32_t *tok, int n, const int *rows, int nr, float *logits) {
-    float xp[Q_HCW];
+    float xp[Q_H];
     const int p0 = e->n_past;
     if (use_mtp(e) && p0 > 0) memcpy(xp, e->x_last, sizeof(xp));
     q_forward(e, tok, n, rows, nr, logits);
@@ -708,11 +637,11 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
             for (int i = 0; i < m - 1; i++) nxt[i] = e->hist[P - m + 1 + i];
             nxt[m - 1] = tok;
             const int lr = m - 1, r0 = 0;
-            q_mtp_forward(e, e->X, Q_HCW, nxt, m, P - m, &lr, k > 0, qlog);
+            q_mtp_forward(e, e->X, Q_H, true, nxt, m, P - m, &lr, k > 0, qlog);
             e->mtp_valid = P;
             for (int i = 0; i < k; i++) {
-                if (i > 0) q_mtp_forward(e, e->X2 + (size_t)(i == 1 ? m - 1 : 0) * Q_HCW,
-                                         Q_HCW, &vt[i], 1, P - 1 + i, &r0, 1, qlog + (size_t)i * Q_VOCAB);
+                if (i > 0) q_mtp_forward(e, e->X2 + (size_t)(i == 1 ? m - 1 : 0) * Q_H, Q_H, false, &vt[i], 1, P - 1 + i, &r0, 1,
+                                         qlog + (size_t)i * Q_VOCAB);
                 memcpy(e->hist + P, vt, sizeof(int32_t) * (size_t)(i + 1));  // penalties see the drafted prefix
                 const int hn = P + i + 1 > 256 ? 256 : P + i + 1;
                 const int *ix;
@@ -782,7 +711,7 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
         if (keep_i < k) {                       // rewind the recurrent state to just after vt[keep_i]
             rec_copy(&e->st, &e->snap[keep_i]);
             e->n_past = P + keep_i + 1;
-            memcpy(e->x_last, e->X + (size_t)keep_i * Q_HCW, sizeof(float) * Q_HCW);
+            memcpy(e->x_last, e->X + (size_t)keep_i * Q_H, sizeof(float) * Q_H);
         }
         m = keep_i + 1;
         if (stop) break;
@@ -792,7 +721,7 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
     if (use_mtp(e) && e->mtp_valid >= 0 && m > 1 && e->mtp_valid == e->n_past - m) {
         int32_t nxt[Q_SPEC_MAX + 1];
         for (int i = 0; i < m - 1; i++) nxt[i] = e->hist[e->n_past - m + 1 + i];
-        q_mtp_forward(e, e->X, Q_HCW, nxt, m - 1, e->n_past - m, NULL, 0, NULL);
+        q_mtp_forward(e, e->X, Q_H, true, nxt, m - 1, e->n_past - m, NULL, 0, NULL);
         e->mtp_valid = e->n_past - 1;
     }
     res->t_decode = inz_now() - td;
@@ -855,7 +784,7 @@ float *engine_eval_snapshots(inz_engine *e, const int32_t *tokens, int n, int la
         for (int i = 0; i <= keep; i++) memcpy(out + (size_t)(p - from + i) * Q_VOCAB, lg + (size_t)i * Q_VOCAB, sizeof(float) * Q_VOCAB);
         rec_copy(&e->st, &e->snap[keep]);
         e->n_past = p + keep + 1;
-        memcpy(e->x_last, e->X + (size_t)keep * Q_HCW, sizeof(float) * Q_HCW);
+        memcpy(e->x_last, e->X + (size_t)keep * Q_H, sizeof(float) * Q_H);
         p += keep + 1;
     }
     free(lg);
@@ -908,27 +837,21 @@ void engine_diag_json(inz_engine *e, jw *w) {
         jw_arr_end(w);
         jw_key(w, "layer_hit_rate");
         jw_arr(w);
-        for (int l = 0; l < e->n_layer; l++) {
+        for (int l = 0; l < e->n_moe; l++) {
             const uint64_t h = st->layer_hits[l], m = st->layer_misses[l];
             jw_num(w, h + m ? (double)h / (h + m) : 0);
         }
         jw_arr_end(w);
         jw_obj_end(w);
     }
-    jw_key(w, "head");
-    jw_obj(w);
-    jw_kbool(w, "two_stage", e->two_stage);
-    jw_knum(w, "screen_sigma", e->head_sigma);
-    jw_knum(w, "avg_candidates", e->head_rows ? (double)e->head_cands / (double)e->head_rows : 0);
-    jw_obj_end(w);
     jw_key(w, "memory");
     jw_obj(w);
     jw_knum(w, "rss_gb", inz_rss() / 1e9);
     jw_knum(w, "available_gb", inz_mem_available() / 1e9);
     jw_knum(w, "dense_gb", e->dense_bytes / 1e9);
     jw_knum(w, "cache_gb", e->ec ? ec_slot_count(e->ec) * (double)e->blob_bytes / 1e9 : 0);
-    jw_knum(w, "recurrent_state_gb", (double)(S_FLOATS + CONV_FLOATS + PLE_FLOATS) * 4 / 1e9);
-    jw_knum(w, "kv_gb", (double)e->n_past * Q_N_ATTN * (2.0 * Q_KV * 2 + Q_IDX_HD * 4 + Q_IDX_HD) / 1e9);
+    jw_knum(w, "recurrent_state_gb", (double)(S_FLOATS + CONV_FLOATS) * 4 / 1e9);
+    jw_knum(w, "kv_gb", (double)e->n_past * Q_N_ATTN * 2.0 * Q_KV * 2 / 1e9);
     jw_obj_end(w);
     const tp_stats *ts = tp_get_stats(e->tp);
     jw_key(w, "thread_busy_s");

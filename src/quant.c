@@ -19,6 +19,7 @@ int inz_qtype_bits(int type) {
     case INZ_T_Q4L: return 4;
     case INZ_T_Q4N: return 4;
     case INZ_T_Q8G: return 8;
+    case INZ_T_F8T: return 8;
     default: return 0;
     }
 }
@@ -28,6 +29,7 @@ size_t inz_qtype_group_bytes(int type) { return type == INZ_T_Q3P ? 16 : (size_t
 static int type_bias(int type) { return type == INZ_T_Q8G ? 128 : INZ_LUT_BIAS; }
 
 size_t inz_qmat_bytes(int type, int rows, int cols) {
+    if (type == INZ_T_F8T) return INZ_ALIGN_UP(sizeof(inz_qhdr) + (size_t)rows * cols, 64);
     size_t ng = (size_t)cols / INZ_GROUP;
     size_t n = sizeof(inz_qhdr) + (size_t)rows * ng * inz_qtype_group_bytes(type) + (size_t)rows * ng * 2;
     if (type == INZ_T_Q3P) n += (size_t)rows * ng * 8;
@@ -53,6 +55,7 @@ const char *inz_qtype_name(int type) {
     case INZ_T_Q8G: return "Q8G";
     case INZ_T_Q3P: return "Q3P";
     case INZ_T_Q4N: return "Q4N";
+    case INZ_T_F8T: return "F8T";
     case INZ_T_FP8: return "FP8";
     case INZ_T_EXPERTS: return "EXPERTS";
     default: return "?";
@@ -60,7 +63,7 @@ const char *inz_qtype_name(int type) {
 }
 
 int inz_qtype_from_name(const char *s) {
-    static const int all[] = {INZ_T_F32, INZ_T_F16, INZ_T_BF16, INZ_T_Q2L, INZ_T_Q3L, INZ_T_Q4L, INZ_T_Q8G, INZ_T_Q3P, INZ_T_Q4N};
+    static const int all[] = {INZ_T_F32, INZ_T_F16, INZ_T_BF16, INZ_T_Q2L, INZ_T_Q3L, INZ_T_Q4L, INZ_T_Q8G, INZ_T_Q3P, INZ_T_Q4N, INZ_T_F8T};
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         if (!strcasecmp(s, inz_qtype_name(all[i]))) return all[i];
     return -1;
@@ -84,6 +87,10 @@ bool inz_qmat_view(inz_qmat *m, const void *payload) {
     if (m->type == INZ_T_Q3P) m->f = (const uint8_t *)(m->d + (size_t)m->rows * m->ngroups);
     if (m->type == INZ_T_Q4N) {
         m->s8 = (const uint8_t *)m->d;
+        m->d = NULL;
+        memcpy(&m->gscale, h->pad2, sizeof(float));
+    }
+    if (m->type == INZ_T_F8T) {
         m->d = NULL;
         memcpy(&m->gscale, h->pad2, sizeof(float));
     }
@@ -560,6 +567,10 @@ void inz_dequantize_row(const inz_qmat *m, int row, float *out) {
     const int bias = type_bias(m->type);
     for (int g = 0; g < m->ngroups; g++) {
         const size_t gi = (size_t)row * m->ngroups + g;
+        if (m->type == INZ_T_F8T) {
+            for (int j = 0; j < INZ_GROUP; j++) out[g * INZ_GROUP + j] = inz_e4m3_to_f32(m->q[gi * INZ_GROUP + j]) * m->gscale;
+            continue;
+        }
         if (m->type == INZ_T_Q4N) {
             unpack_group(INZ_T_Q4L, m->q + gi * 32, idx);
             for (int j = 0; j < INZ_GROUP; j++)
@@ -893,19 +904,20 @@ static void mm_q8g(const inz_qmat *m, const inz_act *acts, int nt, float *Y, int
  * as Q4L) and 4 e4m3 scales, one per 16 weights. The LUT maps a code to 64 + 2*e2m1 (an integer in [52, 76]), so
  * weight = (lut - 64) * scale * gscale with gscale = 1 / (2 * global). Each 32-bit lane of VPDPBUSD covers 4 weights
  * of one 16-weight block: the accumulator starts from the activation's -64 * sum4 (the LUT bias), and the lanes of
- * a block are scaled by its e4m3 scale, decoded as an fp16 bit pattern (v << 7) + 0x2000 (positive normal e4m3). */
+ * a block are scaled by its e4m3 scale, decoded as the fp16 bit pattern v << 7: the scale divided by 2^8, exact for
+ * zero and subnormal scales too; the 2^8 is applied with gscale at the end. */
 static const float k_e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
 static inline __m256 q4n_scale4(const uint8_t *s) {  // 4 e4m3 scales (one group) -> f32 lanes 0..3
     int32_t w;
     memcpy(&w, s, 4);
     const __m128i v = _mm_cvtepu8_epi16(_mm_cvtsi32_si128(w));
-    return _mm256_cvtph_ps(_mm_add_epi16(_mm_slli_epi16(v, 7), _mm_set1_epi16(0x2000)));
+    return _mm256_cvtph_ps(_mm_slli_epi16(v, 7));
 }
 
 static inline __m256 q4n_scale8(const uint8_t *s) {  // 8 e4m3 scales (two groups) -> f32
     const __m128i v = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)s));
-    return _mm256_cvtph_ps(_mm_add_epi16(_mm_slli_epi16(v, 7), _mm_set1_epi16(0x2000)));
+    return _mm256_cvtph_ps(_mm_slli_epi16(v, 7));
 }
 
 static void q4n_header(inz_qhdr *h, int rows, int cols, float gscale) {
@@ -923,13 +935,23 @@ static void q4n_header(inz_qhdr *h, int rows, int cols, float gscale) {
     memcpy(h->pad2, &gscale, sizeof(float));
 }
 
-static bool e4m3_normal_positive(uint8_t v) { return !(v & 0x80) && ((v >> 3) & 15) != 0 && v != 0x7F; }
+static bool e4m3_nonnegative(uint8_t v) { return !(v & 0x80) && v != 0x7F; }  // zero and subnormals included
+
+static bool pack_q4n(const uint8_t *packed, const uint8_t *scales, float gscale, int rows, int cols, void *out);
 
 bool inz_pack_q4n(const uint8_t *packed, const uint8_t *scales, float global_scale, int rows, int cols, void *out) {
+    return pack_q4n(packed, scales, 0.5f / global_scale, rows, cols, out);
+}
+
+bool inz_pack_q4n_mul(const uint8_t *packed, const uint8_t *scales, float scale_2, int rows, int cols, void *out) {
+    return pack_q4n(packed, scales, 0.5f * scale_2, rows, cols, out);  // exact: a power of 2 times scale_2
+}
+
+static bool pack_q4n(const uint8_t *packed, const uint8_t *scales, float gscale, int rows, int cols, void *out) {
     if (cols % INZ_GROUP) inz_die("q4n: cols %d not a multiple of 64", cols);
     const int ng = cols / INZ_GROUP;
     memset(out, 0, inz_qmat_bytes(INZ_T_Q4N, rows, cols));
-    q4n_header(out, rows, cols, 0.5f / global_scale);
+    q4n_header(out, rows, cols, gscale);
     uint8_t *q = (uint8_t *)out + sizeof(inz_qhdr), *s8 = q + (size_t)rows * ng * 32;
     bool ok = true;
     for (int r = 0; r < rows; r++) {
@@ -943,7 +965,7 @@ bool inz_pack_q4n(const uint8_t *packed, const uint8_t *scales, float global_sca
             }
             for (int b = 0; b < 4; b++) {
                 const uint8_t v = sr[g * 4 + b];
-                ok &= e4m3_normal_positive(v);
+                ok &= e4m3_nonnegative(v);
                 s8[((size_t)r * ng + g) * 4 + b] = v;
             }
         }
@@ -1037,12 +1059,12 @@ static void mv_q4n(const inz_qmat *m, const inz_act *a, float *y, int r0, int r1
                 const uint8_t *ss = (rr ? s1 : s0) + g * 4;
                 float acc = 0;
                 for (int j = 0; j < 64; j++)
-                    acc += (float)((int)m->lut[idx[j]] - INZ_LUT_BIAS) * inz_e4m3_to_f32(ss[j / 16]) * (float)a->q[g * 64 + j];
+                    acc += (float)((int)m->lut[idx[j]] - INZ_LUT_BIAS) * (inz_e4m3_to_f32(ss[j / 16]) / 256.0f) * (float)a->q[g * 64 + j];
                 if (rr) t1 += acc * a->s[g]; else t0 += acc * a->s[g];
             }
         }
-        y[r] = t0 * m->gscale;
-        y[r + 1] = t1 * m->gscale;
+        y[r] = t0 * (m->gscale * 256.0f);
+        y[r + 1] = t1 * (m->gscale * 256.0f);
     }
     for (; r < r1; r++) {  // odd last row: scalar reference path
         float row[16384];
@@ -1082,7 +1104,7 @@ static void mm_q4n(const inz_qmat *m, const inz_act *acts, int nt, float *Y, int
                     acc[t] = _mm256_fmadd_ps(part, _mm256_set1_ps(a->s[g]), acc[t]);
                 }
             }
-            for (int t = 0; t < tn; t++) Y[(size_t)(t0 + t) * ldy + r] = hsum8(acc[t]) * m->gscale;
+            for (int t = 0; t < tn; t++) Y[(size_t)(t0 + t) * ldy + r] = hsum8(acc[t]) * (m->gscale * 256.0f);
         }
     }
 }
@@ -1274,6 +1296,89 @@ void inz_matmul_f16_rows(const uint16_t *W, int K, const float *X, int ldx, int 
         for (int t = tb; t < te && r < r1; t++) inz_matvec_f16_rows(W, K, X + (size_t)t * ldx, Y + (size_t)t * ldy, r, r1);
     }
 #undef CV
+}
+
+/* ---- F8T: FP8 e4m3 weights with one per-tensor scale ----
+ * Eight e4m3 bytes become eight fp16 bit patterns ((b & 0x7F) << 7 | sign << 15): the same numbers divided by 2^8,
+ * subnormals included, so cvtph yields the weights exactly and the 2^8 joins the per-tensor scale. Each row keeps
+ * the F16 kernels' accumulation order (one 8-wide accumulator), and matmul runs the F16 kernels on rows decoded
+ * into a small buffer, so one token gets the same bits from matvec (decode) and matmul (speculative verify). */
+// 16 bytes at a time: (b << 8) >> 1 (arithmetic) keeps the sign in bit 15, copies it into bit 14 (cleared by the
+// mask) and puts the magnitude in bits 13..7
+static inline __m256i f8_to_f16x16(const uint8_t *p) {
+    const __m256i b = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)p));
+    return _mm256_and_si256(_mm256_srai_epi16(_mm256_slli_epi16(b, 8), 1), _mm256_set1_epi16((short)0xBF80));
+}
+
+#define F8_LO(h) _mm256_cvtph_ps(_mm256_castsi256_si128(h))
+#define F8_HI(h) _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1))
+
+void inz_pack_f8t(const uint8_t *w, float scale, int rows, int cols, void *out) {
+    if (cols % INZ_GROUP) inz_die("f8t: cols %d not a multiple of 64", cols);
+    inz_qhdr *h = out;
+    memset(h, 0, sizeof(*h));
+    h->magic = QMAGIC;
+    h->type = INZ_T_F8T;
+    h->rows = (uint32_t)rows;
+    h->cols = (uint32_t)cols;
+    h->bits = 8;
+    memcpy(h->pad2, &scale, sizeof(float));
+    memcpy((uint8_t *)out + sizeof(inz_qhdr), w, (size_t)rows * cols);
+}
+
+void inz_matvec_f8t_rows(const inz_qmat *m, const float *x, float *y, int r0, int r1) {
+    const int K = m->cols;  // multiple of 64
+    const float g = m->gscale * 256.0f;
+    int r = r0;
+    for (; r + 4 <= r1; r += 4) {  // four independent rows: the FMA chains overlap
+        const uint8_t *w0 = m->q + (size_t)r * K, *w1 = w0 + K, *w2 = w1 + K, *w3 = w2 + K;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        for (int j = 0; j < K; j += 16) {
+            const __m256 xa = _mm256_loadu_ps(x + j), xb = _mm256_loadu_ps(x + j + 8);
+            const __m256i h0 = f8_to_f16x16(w0 + j), h1 = f8_to_f16x16(w1 + j), h2 = f8_to_f16x16(w2 + j), h3 = f8_to_f16x16(w3 + j);
+            a0 = _mm256_fmadd_ps(F8_LO(h0), xa, a0);
+            a1 = _mm256_fmadd_ps(F8_LO(h1), xa, a1);
+            a2 = _mm256_fmadd_ps(F8_LO(h2), xa, a2);
+            a3 = _mm256_fmadd_ps(F8_LO(h3), xa, a3);
+            a0 = _mm256_fmadd_ps(F8_HI(h0), xb, a0);
+            a1 = _mm256_fmadd_ps(F8_HI(h1), xb, a1);
+            a2 = _mm256_fmadd_ps(F8_HI(h2), xb, a2);
+            a3 = _mm256_fmadd_ps(F8_HI(h3), xb, a3);
+        }
+        y[r] = hsum8(a0) * g;
+        y[r + 1] = hsum8(a1) * g;
+        y[r + 2] = hsum8(a2) * g;
+        y[r + 3] = hsum8(a3) * g;
+    }
+    for (; r < r1; r++) {
+        const uint8_t *w = m->q + (size_t)r * K;
+        __m256 a0 = _mm256_setzero_ps();
+        for (int j = 0; j < K; j += 16) {
+            const __m256i h = f8_to_f16x16(w + j);
+            a0 = _mm256_fmadd_ps(F8_LO(h), _mm256_loadu_ps(x + j), a0);
+            a0 = _mm256_fmadd_ps(F8_HI(h), _mm256_loadu_ps(x + j + 8), a0);
+        }
+        y[r] = hsum8(a0) * g;
+    }
+}
+
+void inz_matmul_f8t_rows(const inz_qmat *m, const float *X, int ldx, int n, float *Y, int ldy, int r0, int r1) {
+    static _Thread_local uint16_t buf[49152];  // decoded rows (96 KiB: stays in L2 while the tokens stream past)
+    const int K = m->cols;
+    const float g = m->gscale * 256.0f;
+    const int chunk = (int)(sizeof(buf) / sizeof(buf[0])) / K;
+    if (chunk < 1) inz_die("f8t: %d columns exceed the decode buffer", K);
+    for (int c0 = r0; c0 < r1; c0 += chunk) {
+        const int cr = r1 - c0 < chunk ? r1 - c0 : chunk;
+        for (int i = 0; i < cr; i++) {
+            const uint8_t *w = m->q + (size_t)(c0 + i) * K;
+            uint16_t *d = buf + (size_t)i * K;
+            for (int j = 0; j < K; j += 16) _mm256_storeu_si256((__m256i *)(d + j), f8_to_f16x16(w + j));
+        }
+        inz_matmul_f16_rows(buf, K, X, ldx, n, Y + c0, ldy, 0, cr);
+        for (int t = 0; t < n; t++)
+            for (int i = 0; i < cr; i++) Y[(size_t)t * ldy + c0 + i] *= g;
+    }
 }
 
 /* ------------------------------------------------------------------ */

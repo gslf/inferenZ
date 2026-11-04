@@ -1,4 +1,4 @@
-// Qwen3.8-Flash-Next chat template (C port of chat_template.jinja) and output parsing
+// Nemotron 3.5 Super chat template (C port of chat_template.jinja) and output parsing
 // (reasoning / content / tool calls) for the OpenAI-compatible API.
 #ifndef INZ_CHAT_H
 #define INZ_CHAT_H
@@ -9,7 +9,7 @@
 #include "json.h"
 
 // messages: JSON array of {role, content, reasoning_content?, tool_calls?}; tools: JSON array or NULL.
-// effort: NULL (template default: xhigh), "xhigh" | "high" | "max" -> xhigh, "medium", "low",
+// effort: NULL or "high" (template default: thinking on), "medium" | "low" -> efficient thinking,
 // "none" | "minimal" | "off" -> thinking disabled. Returns malloc'ed prompt text.
 char *chat_render(const jval *messages, const jval *tools, const char *effort, bool add_generation_prompt);
 // true when the rendered generation prompt leaves the model inside a <think> block

@@ -105,47 +105,56 @@ static void render_content(sbuf *s, const jval *content) {
 
 static bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
 
-// Jinja's `trim` (Python str.strip())
-static char *trimmed(const jval *content, size_t *len) {
-    sbuf s = {0};
-    render_content(&s, content);
-    const char *p = s.b ? s.b : "";
-    size_t n = s.n;
-    size_t a = 0;
-    while (a < n && is_ws(p[a])) a++;
-    while (n > a && is_ws(p[n - 1])) n--;
-    char *r = inz_malloc(n - a + 1);
-    memcpy(r, p + a, n - a);
-    r[n - a] = 0;
-    *len = n - a;
-    free(s.b);
-    return r;
+// Jinja's `trim` (Python str.strip()) of a string
+static void trim_span(const char *p, size_t n, const char **a, size_t *len) {
+    size_t i = 0;
+    while (i < n && is_ws(p[i])) i++;
+    while (n > i && is_ws(p[n - 1])) n--;
+    *a = p + i;
+    *len = n - i;
 }
 
-static const char *resolve_effort(const char *effort, bool *thinking) {
+static void put_trimmed(sbuf *s, const char *p, size_t n) {
+    const char *a;
+    size_t l;
+    trim_span(p, n, &a, &l);
+    sb_put(s, a, l);
+}
+
+// Jinja's `| string`: Python str() of a JSON value (True/False/None for the literals, json for containers)
+static void py_str(sbuf *s, const jval *v) {
+    if (!v || v->type == JNULL) { sb_puts(s, "None"); return; }
+    if (v->type == JSTR) { sb_put(s, v->str, v->len); return; }
+    if (v->type == JBOOL) { sb_puts(s, v->b ? "True" : "False"); return; }
+    if (v->type == JNUM) {
+        // the parsed JSON keeps no int/float distinction: integral values print as Python ints
+        if (v->num == floor(v->num) && fabs(v->num) < 1e16) { py_num(s, v->num); return; }
+        char tmp[64];
+        for (int prec = 1; prec <= 17; prec++) {  // Python repr of a float: shortest round trip, ".0" when integral
+            snprintf(tmp, sizeof(tmp), "%.*g", prec, v->num);
+            if (strtod(tmp, NULL) == v->num) break;
+        }
+        if (!strpbrk(tmp, ".eEn")) strcat(tmp, ".0");
+        sb_puts(s, tmp);
+        return;
+    }
+    py_json(s, v);  // Python would print a dict / list repr; templates only stringify scalars here
+}
+
+// Effort: "none" | "minimal" | "off" -> thinking disabled; "low" | "medium" -> efficient thinking (the template's
+// medium_effort); anything else (default) -> thinking on.
+static void resolve_effort(const char *effort, bool *thinking, bool *medium) {
     *thinking = true;
-    if (!effort || !*effort) return "xhigh";
-    if (!strcmp(effort, "none") || !strcmp(effort, "minimal") || !strcmp(effort, "off")) { *thinking = false; return NULL; }
-    if (!strcmp(effort, "low")) return "low";
-    if (!strcmp(effort, "medium")) return "medium";
-    return "xhigh";  // "high", "xhigh", "max" and anything else
+    *medium = false;
+    if (!effort || !*effort) return;
+    if (!strcmp(effort, "none") || !strcmp(effort, "minimal") || !strcmp(effort, "off")) *thinking = false;
+    else if (!strcmp(effort, "low") || !strcmp(effort, "medium")) *medium = true;
 }
 
 bool chat_thinking_enabled(const char *effort) {
-    bool t;
-    resolve_effort(effort, &t);
+    bool t, m;
+    resolve_effort(effort, &t, &m);
     return t;
-}
-
-static const char *reasoning_text(const char *eff) {
-    if (!eff) return "";
-    if (!strcmp(eff, "xhigh"))
-        return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
-               "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
-    if (!strcmp(eff, "low"))
-        return "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion "
-               "without unnecessary elaboration.";
-    return "";  // medium: no instructions
 }
 
 static const char *role_of(const jval *m) { return json_str(json_get(m, "role"), ""); }
@@ -164,123 +173,209 @@ static jval *args_object(const jval *args, jval **owned) {
     return NULL;
 }
 
+static bool in_list(const char *k, const char *const *list) {
+    for (; *list; list++) if (!strcmp(k, *list)) return true;
+    return false;
+}
+
+// the template's render_extra_keys(): the keys not handled explicitly, as <key>value</key>
+static void extra_keys(sbuf *s, const jval *obj, const char *const *handled) {
+    if (!obj || obj->type != JOBJ) return;
+    for (const jval *c = obj->child; c; c = c->next) {
+        if (in_list(c->key, handled)) continue;
+        sb_puts(s, "\n<"); sb_puts(s, c->key); sb_puts(s, ">");
+        if (c->type == JOBJ || c->type == JARR) py_json(s, c);
+        else py_str(s, c);
+        sb_puts(s, "</"); sb_puts(s, c->key); sb_puts(s, ">");
+    }
+}
+
+static void render_tools(sbuf *s, const jval *tools) {
+    static const char *const h_param[] = {"name", "type", "description", "enum", NULL};
+    static const char *const h_params[] = {"type", "properties", "required", NULL};
+    static const char *const h_tool[] = {"type", "name", "description", "parameters", NULL};
+    sb_puts(s, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for (const jval *t = tools->child; t; t = t->next) {
+        const jval *f = json_get(t, "function") ? json_get(t, "function") : t;
+        sb_puts(s, "\n<function>\n<name>");
+        py_str(s, json_get(f, "name"));
+        sb_puts(s, "</name>");
+        const jval *d = json_get(f, "description");
+        if (d) {
+            sbuf tmp = {0};
+            py_str(&tmp, d);
+            sb_puts(s, "\n<description>"); put_trimmed(s, tmp.b ? tmp.b : "", tmp.n); sb_puts(s, "</description>");
+            free(tmp.b);
+        }
+        sb_puts(s, "\n<parameters>");
+        const jval *ps = json_get(f, "parameters");
+        const jval *props = ps && ps->type == JOBJ ? json_get(ps, "properties") : NULL;
+        if (props && props->type == JOBJ)
+            for (const jval *p = props->child; p; p = p->next) {
+                sb_puts(s, "\n<parameter>\n<name>"); sb_puts(s, p->key); sb_puts(s, "</name>");
+                const jval *ty = json_get(p, "type"), *pd = json_get(p, "description"), *en = json_get(p, "enum");
+                if (ty) { sb_puts(s, "\n<type>"); py_str(s, ty); sb_puts(s, "</type>"); }
+                if (pd) {
+                    sbuf tmp = {0};
+                    py_str(&tmp, pd);
+                    sb_puts(s, "\n<description>"); put_trimmed(s, tmp.b ? tmp.b : "", tmp.n); sb_puts(s, "</description>");
+                    free(tmp.b);
+                }
+                if (en) { sb_puts(s, "\n<enum>"); py_json(s, en); sb_puts(s, "</enum>"); }
+                extra_keys(s, p, h_param);
+                sb_puts(s, "\n</parameter>");
+            }
+        extra_keys(s, ps, h_params);
+        const jval *req = ps && ps->type == JOBJ ? json_get(ps, "required") : NULL;
+        if (req) { sb_puts(s, "\n<required>"); py_json(s, req); sb_puts(s, "</required>"); }
+        sb_puts(s, "\n</parameters>");
+        extra_keys(s, f, h_tool);
+        sb_puts(s, "\n</function>");
+    }
+    sb_puts(s, "\n</tools>");
+    sb_puts(s, "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
+               "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+               "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple "
+               "lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow "
+               "the specified format: an inner <function=...></function> block must be nested within "
+               "<tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional "
+               "reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If "
+               "there is no function call available, answer the question like normal with your current knowledge and "
+               "do not tell the user about function calls\n</IMPORTANT>");
+}
+
+// Python str.split(sep)[-1] / [0]
+static const char *after_last(const char *s, const char *sep) {
+    const char *r = s, *p;
+    while ((p = strstr(r, sep))) r = p + strlen(sep);
+    return r;
+}
+
+// C port of chat_template.jinja (enable_thinking, medium_effort, truncate_history_thinking = true).
 char *chat_render(const jval *messages, const jval *tools, const char *effort, bool add_generation_prompt) {
     sbuf s = {0};
-    bool thinking;
-    const char *eff = resolve_effort(effort, &thinking);
-    const char *ri = thinking ? reasoning_text(eff) : "";
+    bool thinking, medium;
+    resolve_effort(effort, &thinking, &medium);
     const size_t nmsg = messages && messages->type == JARR ? messages->len : 0;
     const jval *first = json_at(messages, 0);
     const bool first_system = first && !strcmp(role_of(first), "system");
+    const size_t m0 = first_system ? 1 : 0;   // loop_messages = messages[m0:]
+    const bool have_tools = tools && tools->type == JARR && tools->len;
 
-    if (tools && tools->type == JARR && tools->len) {
-        sb_puts(&s, IM_START "system\n");
-        if (*ri) { sb_puts(&s, ri); sb_puts(&s, "\n\n"); }
-        sb_puts(&s, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
-        for (jval *t = tools->child; t; t = t->next) { sb_puts(&s, "\n"); py_json(&s, t); }
-        sb_puts(&s, "\n</tools>");
-        sb_puts(&s, "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
-                    "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-                    "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple "
-                    "lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow "
-                    "the specified format: an inner <function=...></function> block must be nested within "
-                    "<tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional "
-                    "reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If "
-                    "there is no function call available, answer the question like normal with your current knowledge and "
-                    "do not tell the user about function calls\n</IMPORTANT>");
-        if (first_system) {
-            size_t n;
-            char *c = trimmed(json_get(first, "content"), &n);
-            if (n) { sb_puts(&s, "\n\n"); sb_put(&s, c, n); }
-            free(c);
-        }
-        sb_puts(&s, IM_END "\n");
-    } else if (first_system) {
-        size_t n;
-        char *c = trimmed(json_get(first, "content"), &n);
-        if (n) {
-            sb_puts(&s, IM_START "system\n");
-            if (*ri) { sb_puts(&s, ri); sb_puts(&s, "\n\n"); }
-            sb_put(&s, c, n);
-            sb_puts(&s, IM_END "\n");
-        } else if (*ri) {
-            sb_puts(&s, IM_START "system\n"); sb_puts(&s, ri); sb_puts(&s, IM_END "\n");
-        }
-        free(c);
-    } else if (*ri) {
-        sb_puts(&s, IM_START "system\n"); sb_puts(&s, ri); sb_puts(&s, IM_END "\n");
+    // the system turn is always rendered (empty without a system message)
+    sbuf sys = {0};
+    if (first_system) render_content(&sys, json_get(first, "content"));
+    sb_puts(&s, IM_START "system\n");
+    if (sys.n) sb_put(&s, sys.b, sys.n);
+    if (have_tools) {
+        if (sys.n) sb_puts(&s, "\n\n");
+        render_tools(&s, tools);
     }
+    sb_puts(&s, IM_END "\n");
+    free(sys.b);
 
-    // last_query_index: the last user message that is not a pure tool_response wrapper
-    long last_query = -1;
-    for (long i = (long)nmsg - 1; i >= 0; i--) {
-        const jval *m = json_at(messages, (size_t)i);
-        if (strcmp(role_of(m), "user")) continue;
-        size_t n;
-        char *c = trimmed(json_get(m, "content"), &n);
-        const bool wrapped = n >= 15 && !strncmp(c, "<tool_response>", 15) && n >= 16 && !strcmp(c + n - 16, "</tool_response>");
-        free(c);
-        if (!wrapped) { last_query = i; break; }
-    }
+    long last_user = -1;                        // index in loop_messages
+    for (size_t i = m0; i < nmsg; i++)
+        if (!strcmp(role_of(json_at(messages, i)), "user")) last_user = (long)(i - m0);
 
-    for (size_t i = 0; i < nmsg; i++) {
+    for (size_t i = m0; i < nmsg; i++) {
         const jval *m = json_at(messages, i);
+        const long li = (long)(i - m0);
         const char *role = role_of(m);
-        size_t cn;
-        char *content = trimmed(json_get(m, "content"), &cn);
-        if (!strcmp(role, "system")) {
-            // only valid first; rendered above
-        } else if (!strcmp(role, "user")) {
-            sb_puts(&s, IM_START "user\n"); sb_put(&s, content, cn); sb_puts(&s, IM_END "\n");
-        } else if (!strcmp(role, "assistant")) {
+        sbuf cb = {0};
+        render_content(&cb, json_get(m, "content"));
+        if (!cb.b) sb_puts(&cb, "");
+        if (!strcmp(role, "assistant")) {
             const jval *rc = json_get(m, "reasoning_content");
+            sbuf content = {0};
+            const char *ra;
             size_t rn = 0;
-            char *reasoning = rc && rc->type == JSTR ? trimmed(rc, &rn) : inz_strdup("");
-            // preserve_thinking is undefined (true) here: every assistant turn keeps its <think> block
-            sb_puts(&s, IM_START "assistant\n" THINK_BEGIN "\n");
-            sb_put(&s, reasoning, rn);
-            sb_puts(&s, "\n" THINK_END "\n\n");
-            sb_put(&s, content, cn);
-            free(reasoning);
+            if (rc && rc->type == JSTR) trim_span(rc->str, rc->len, &ra, &rn);
+            if (rn) {
+                sb_puts(&content, THINK_BEGIN "\n");
+                sb_put(&content, rc->str, rc->len);
+                sb_puts(&content, THINK_END);
+                sb_put(&content, cb.b, cb.n);
+            } else {
+                if (!strstr(cb.b, THINK_BEGIN) && !strstr(cb.b, THINK_END)) sb_puts(&content, THINK_BEGIN THINK_END);
+                sb_put(&content, cb.b, cb.n);
+            }
+            const char *c = content.b ? content.b : "";
+            const bool history = li < last_user;  // truncate_history_thinking
             const jval *tc = json_get(m, "tool_calls");
-            if (tc && tc->type == JARR) {
-                size_t k = 0;
-                for (jval *call = tc->child; call; call = call->next, k++) {
+            if (tc && tc->type == JARR && tc->len) {
+                sb_puts(&s, IM_START "assistant\n");
+                const char *ta;
+                size_t tl;
+                trim_span(c, content.n, &ta, &tl);
+                if (tl) {
+                    if (!history) { sb_put(&s, ta, tl); sb_puts(&s, "\n"); }
+                    else {
+                        sbuf h = {0};
+                        sb_puts(&h, THINK_BEGIN THINK_END);
+                        if (strstr(c, THINK_END)) sb_puts(&h, after_last(c, THINK_END));
+                        else if (strstr(c, THINK_BEGIN)) sb_put(&h, c, (size_t)(strstr(c, THINK_BEGIN) - c));
+                        else sb_puts(&h, c);
+                        sb_put(&s, h.b, h.n);
+                        sb_puts(&s, "\n");
+                        free(h.b);
+                    }
+                } else sb_puts(&s, THINK_BEGIN THINK_END);
+                for (const jval *call = tc->child; call; call = call->next) {
                     const jval *fn = json_get(call, "function") ? json_get(call, "function") : call;
-                    const char *name = json_str(json_get(fn, "name"), "");
-                    if (k == 0) sb_puts(&s, cn ? "\n\n" TOOLCALL_BEGIN "\n<function=" : TOOLCALL_BEGIN "\n<function=");
-                    else sb_puts(&s, "\n" TOOLCALL_BEGIN "\n<function=");
-                    sb_puts(&s, name);
+                    sb_puts(&s, TOOLCALL_BEGIN "\n<function=");
+                    py_str(&s, json_get(fn, "name"));
                     sb_puts(&s, ">\n");
                     jval *owned;
                     const jval *args = args_object(json_get(fn, "arguments"), &owned);
                     for (const jval *a = args ? args->child : NULL; a; a = a->next) {
                         sb_puts(&s, "<parameter="); sb_puts(&s, a->key); sb_puts(&s, ">\n");
-                        if (a->type == JSTR) sb_put(&s, a->str, a->len);
-                        else py_json(&s, a);
+                        if (a->type == JOBJ || a->type == JARR) py_json(&s, a);
+                        else py_str(&s, a);
                         sb_puts(&s, "\n</parameter>\n");
                     }
                     json_free(owned);
-                    sb_puts(&s, "</function>\n" TOOLCALL_END);
+                    sb_puts(&s, "</function>\n" TOOLCALL_END "\n");
                 }
+                sb_puts(&s, IM_END "\n");
+            } else if (!history) {
+                sb_puts(&s, IM_START "assistant\n");
+                put_trimmed(&s, c, content.n);
+                sb_puts(&s, IM_END "\n");
+            } else {
+                sbuf h = {0};
+                if (strstr(c, THINK_BEGIN) && strstr(c, THINK_END)) { sb_puts(&h, THINK_BEGIN THINK_END); sb_puts(&h, after_last(c, THINK_END)); }
+                else sb_puts(&h, c);
+                const char *ha;
+                size_t hl;
+                trim_span(h.b ? h.b : "", h.n, &ha, &hl);
+                sb_puts(&s, IM_START "assistant\n");
+                sb_put(&s, ha, hl);
+                sb_puts(&s, IM_END "\n");
+                free(h.b);
             }
+            free(content.b);
+        } else if (!strcmp(role, "user") || !strcmp(role, "system")) {
+            sb_puts(&s, IM_START); sb_puts(&s, role); sb_puts(&s, "\n");
+            sb_put(&s, cb.b, cb.n);
+            if (!strcmp(role, "user") && li == last_user && medium) sb_puts(&s, "\n\n{reasoning effort: efficient}");
             sb_puts(&s, IM_END "\n");
         } else if (!strcmp(role, "tool")) {
-            const jval *prev = i ? json_at(messages, i - 1) : NULL;
+            const jval *prev = i > m0 ? json_at(messages, i - 1) : NULL;
             const jval *next = i + 1 < nmsg ? json_at(messages, i + 1) : NULL;
-            if (prev && strcmp(role_of(prev), "tool")) sb_puts(&s, IM_START "user");
-            sb_puts(&s, "\n<tool_response>\n");
-            sb_put(&s, content, cn);
-            sb_puts(&s, "\n</tool_response>");
+            if (prev && strcmp(role_of(prev), "tool")) sb_puts(&s, IM_START "user\n");
+            sb_puts(&s, "<tool_response>\n");
+            sb_put(&s, cb.b, cb.n);
+            sb_puts(&s, "\n</tool_response>\n");
             if (!next || strcmp(role_of(next), "tool")) sb_puts(&s, IM_END "\n");
+        } else {
+            sb_puts(&s, IM_START); sb_puts(&s, role); sb_puts(&s, "\n");
+            sb_put(&s, cb.b, cb.n);
+            sb_puts(&s, IM_END "\n");
         }
-        free(content);
+        free(cb.b);
     }
-    (void)last_query;  // only affects rendering when preserve_thinking is false
-    if (add_generation_prompt) {
-        sb_puts(&s, IM_START "assistant\n");
-        sb_puts(&s, thinking ? THINK_BEGIN "\n" : THINK_BEGIN "\n\n" THINK_END "\n\n");
-    }
+    if (add_generation_prompt) sb_puts(&s, thinking ? IM_START "assistant\n" THINK_BEGIN "\n" : IM_START "assistant\n" THINK_BEGIN THINK_END);
     if (!s.b) sb_puts(&s, "");
     return s.b;
 }

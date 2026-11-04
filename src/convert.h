@@ -7,17 +7,17 @@
 typedef struct {
     const char *src_dir;
     const char *out_path;
-    // storage types (INZ_T_*): F16 keeps the BF16 source practically exact
-    int t_dense;       // DeltaNet and QSA projections
-    int t_hc;          // hyper-connection mixers
-    int t_shared;      // shared expert
-    int t_router;      // MoE router
-    int t_ple;         // n-gram embedding projections (layer 1)
-    int t_experts;     // routed experts
-    int t_head, t_head_screen, t_embed;
+    // storage types (INZ_T_*). The defaults copy the official checkpoint exactly: F8T for its FP8 tensors, Q4N for
+    // its NVFP4 tensors, F16 for its BF16 matrices (BF16 has 7 mantissa bits, F16 has 10).
+    int t_mamba;       // Mamba-2 in/out projections (FP8)
+    int t_attn;        // attention projections (FP8)
+    int t_shared;      // shared expert (NVFP4)
+    int t_latent;      // LatentMoE projections (BF16)
+    int t_router;      // MoE router (BF16)
+    int t_mtp;         // MTP input projection and attention (BF16)
+    int t_experts;     // routed experts (NVFP4)
+    int t_head, t_embed;
     int max_layers;    // truncate (for tests)
-    bool rot8;         // Hadamard-rotate Q8G layer tensors (spreads activation outliers before int8)
-    bool no_ngram;     // skip the 51 GB n-gram table (only for truncated test models without layer 1)
     const char *imatrix;  // importance matrix (INZ_IMATRIX=file inz dump ...): weights the quantization error
     int threads;
 } convert_opts;

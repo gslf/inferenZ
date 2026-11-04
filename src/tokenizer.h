@@ -1,5 +1,5 @@
-// Byte-level BPE tokenizer matching the MiniMax-M3.1 tokenizer.json:
-// NFC normalizer -> o200k-style regex split -> byte-level BPE merges, with added tokens.
+// Byte-level BPE tokenizer matching a HF tokenizer.json: optional NFC normalizer -> regex split (o200k, Qwen or
+// Tekken flavour) -> byte-level BPE merges, with added tokens.
 #ifndef INZ_TOKENIZER_H
 #define INZ_TOKENIZER_H
 
@@ -9,7 +9,9 @@
 
 typedef struct tokenizer tokenizer;
 
-enum { TOK_SPLIT_O200K = 0, TOK_SPLIT_QWEN = 1 };
+// TEKKEN (Mistral / Nemotron): no normalizer, single digits, no contractions; a pre-token found whole in the
+// vocabulary is emitted as is ("ignore_merges").
+enum { TOK_SPLIT_O200K = 0, TOK_SPLIT_QWEN = 1, TOK_SPLIT_TEKKEN = 2 };
 void tok_set_split(tokenizer *t, int split);
 int tok_get_split(const tokenizer *t);
 

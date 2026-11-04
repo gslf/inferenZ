@@ -15,9 +15,9 @@
 typedef enum {
     DG_EMBED,
     DG_ATTN_NORM,
-    DG_ATTN_QKV,        // q/k/v + index q/k projections
+    DG_ATTN_QKV,        // attention block
     DG_ATTN_INDEX,      // MSA block scoring / top-k
-    DG_ATTN_CORE,       // softmax(QK)V over selected blocks
+    DG_ATTN_CORE,       // Mamba-2 block
     DG_ATTN_OUT,        // o_proj
     DG_FFN_NORM,
     DG_ROUTER,
@@ -29,7 +29,7 @@ typedef enum {
     DG_DENSE_FFN,       // layers 0-2
     DG_LM_HEAD,
     DG_SAMPLE,
-    DG_DRAFT,           // DSpark drafter
+    DG_DRAFT,           // MTP input projection
     DG_VERIFY_EXTRA,    // speculative bookkeeping
     DG_OTHER,
     DG_N_STAGES
@@ -37,7 +37,7 @@ typedef enum {
 
 typedef enum { PH_PREFILL, PH_DECODE, PH_VERIFY, PH_DRAFT, DG_N_PHASES } diag_phase;
 
-#define DIAG_MAX_LAYERS 64
+#define DIAG_MAX_LAYERS 96
 #define DIAG_WINDOW 128
 
 typedef struct {
@@ -67,7 +67,8 @@ typedef struct {
     double last_token_time;
     double prefill_tps_last, decode_tps_last, ttft_last;
     // routing analytics
-    int n_layers, n_experts, topk;
+    int n_blocks;                // blocks with stage counters
+    int n_layers, n_experts, topk;  // routing: MoE blocks
     uint64_t *sel_hist;          // [layers * experts]
     uint64_t adj_pairs[DIAG_MAX_LAYERS];
     double adj_overlap[DIAG_MAX_LAYERS];
@@ -83,7 +84,7 @@ typedef struct {
 
 extern diag_state g_diag;
 
-void diag_init(int n_layers, int n_experts, int topk);
+void diag_init(int n_blocks, int n_layers, int n_experts, int topk);
 void diag_reset(void);
 static inline uint64_t diag_tsc(void) { return __rdtsc(); }
 
