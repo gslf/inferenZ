@@ -22,9 +22,12 @@ import time
 CHUNK = 32 << 20
 
 
+IP_FLAG = []  # ["-4"] with --ipv4
+
+
 def curl(url, rng=None, retries=20):
     cmd = ["curl", "-sfL", "--retry", "10", "--retry-all-errors", "--connect-timeout", "30",
-           "--speed-limit", "10000", "--speed-time", "60", "-A", "inferenz-hfget/1"]
+           "--speed-limit", "10000", "--speed-time", "60", "-A", "inferenz-hfget/1"] + IP_FLAG
     if rng:
         cmd += ["-r", rng]
     cmd.append(url)
@@ -59,7 +62,10 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--skip-vision", action="store_true")
+    ap.add_argument("--ipv4", action="store_true", help="IPv4 only (for networks whose IPv6 path stalls)")
     a = ap.parse_args()
+    if a.ipv4:
+        IP_FLAG.append("-4")
     os.makedirs(a.out, exist_ok=True)
     base = f"https://huggingface.co/{a.repo}/resolve/main/"
     log = open(os.path.join(a.out, ".hfget.log"), "a", buffering=1)
