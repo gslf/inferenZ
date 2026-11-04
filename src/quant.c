@@ -1364,7 +1364,44 @@ void inz_matvec_f8t_rows(const inz_qmat *m, const float *x, float *y, int r0, in
     }
 }
 
+// 2 to 4 tokens (speculative verify): two rows at a time, each 16-weight decode reused for every token, and per
+// (row, token) the matvec's accumulation order, so each token gets the matvec's bits
+static inline __attribute__((always_inline)) void mm_f8t_small(const inz_qmat *m, const float *X, int ldx, const int n,
+                                                              float *Y, int ldy, int r0, int r1) {
+    const int K = m->cols;
+    const float g = m->gscale * 256.0f;
+    int r = r0;
+    for (; r + 2 <= r1; r += 2) {
+        const uint8_t *w0 = m->q + (size_t)r * K, *w1 = w0 + K;
+        __m256 a0[4], a1[4];
+        for (int t = 0; t < n; t++) a0[t] = a1[t] = _mm256_setzero_ps();
+        for (int j = 0; j < K; j += 16) {
+            const __m256i h0 = f8_to_f16x16(w0 + j), h1 = f8_to_f16x16(w1 + j);
+            const __m256 l0 = F8_LO(h0), u0 = F8_HI(h0), l1 = F8_LO(h1), u1 = F8_HI(h1);
+            for (int t = 0; t < n; t++) {
+                const __m256 xa = _mm256_loadu_ps(X + (size_t)t * ldx + j), xb = _mm256_loadu_ps(X + (size_t)t * ldx + j + 8);
+                a0[t] = _mm256_fmadd_ps(l0, xa, a0[t]);
+                a1[t] = _mm256_fmadd_ps(l1, xa, a1[t]);
+                a0[t] = _mm256_fmadd_ps(u0, xb, a0[t]);
+                a1[t] = _mm256_fmadd_ps(u1, xb, a1[t]);
+            }
+        }
+        for (int t = 0; t < n; t++) {
+            Y[(size_t)t * ldy + r] = hsum8(a0[t]) * g;
+            Y[(size_t)t * ldy + r + 1] = hsum8(a1[t]) * g;
+        }
+    }
+    for (; r < r1; r++)
+        for (int t = 0; t < n; t++) inz_matvec_f8t_rows(m, X + (size_t)t * ldx, Y + (size_t)t * ldy, r, r + 1);
+}
+
 void inz_matmul_f8t_rows(const inz_qmat *m, const float *X, int ldx, int n, float *Y, int ldy, int r0, int r1) {
+    switch (n) {
+    case 2: mm_f8t_small(m, X, ldx, 2, Y, ldy, r0, r1); return;
+    case 3: mm_f8t_small(m, X, ldx, 3, Y, ldy, r0, r1); return;
+    case 4: mm_f8t_small(m, X, ldx, 4, Y, ldy, r0, r1); return;
+    default: break;
+    }
     // decoded rows, 1 MiB per thread: as many rows as fit share each block of tokens the F16 kernel streams
     enum { BUF = 1 << 19 };
     static _Thread_local uint16_t *buf;
