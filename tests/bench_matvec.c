@@ -9,18 +9,22 @@
 #include "../src/threadpool.h"
 #include "../src/util.h"
 
-typedef struct { const inz_qmat *m; const inz_act *a; float *y; } job;
+typedef struct { const inz_qmat *m; const inz_act *a; const float *x; float *y; } job;
 
 static void run(void *ctx, int64_t b, int64_t e, int tid) {
     (void)tid;
     job *j = ctx;
-    inz_matvec_rows(j->m, j->a, j->y, (int)b, (int)e);
+    if (j->m->type == INZ_T_F8T) inz_matvec_f8t_rows(j->m, j->x, j->y, (int)b, (int)e);
+    else inz_matvec_rows(j->m, j->a, j->y, (int)b, (int)e);
 }
 
 int main(int argc, char **argv) {
     int nthreads = argc > 1 ? atoi(argv[1]) : 0;
-    int rows = 16384, cols = 8192;
-    tp_pool *tp = tp_create(nthreads, NULL);
+    int rows = argc > 4 ? atoi(argv[3]) : 16384, cols = argc > 4 ? atoi(argv[4]) : 8192;
+    tp_topology topo;  // the engine's placement: one worker per P and E core
+    tp_detect_topology(&topo);
+    int cpus[256];
+    tp_pool *tp = nthreads > 0 ? tp_create(nthreads, NULL) : tp_create(tp_default_cpus(&topo, cpus, 256), cpus);
     printf("threads=%d isa=%s cpus:", tp_size(tp), inz_kernel_isa());
     for (int i = 0; i < tp_size(tp); i++) printf(" %d", tp_cpus(tp)[i]);
     printf("\n");
@@ -30,8 +34,8 @@ int main(int argc, char **argv) {
     float *x = malloc(sizeof(float) * cols), *y = malloc(sizeof(float) * rows);
     for (int j = 0; j < cols; j++) x[j] = sinf(j * 0.37f);
     // Q3P appears twice: full (coarse + fine planes) and coarse-only (2-bit plane, as after a partial read)
-    int types[] = {INZ_T_Q2L, INZ_T_Q3L, INZ_T_Q3P, INZ_T_Q3P, INZ_T_Q4L, INZ_T_Q8G};
-    for (int ti = 0; ti < 6; ti++) {
+    int types[] = {INZ_T_Q2L, INZ_T_Q3L, INZ_T_Q3P, INZ_T_Q3P, INZ_T_Q4L, INZ_T_Q8G, INZ_T_Q4N, INZ_T_F8T};
+    for (int ti = argc > 2 ? 6 : 0; ti < 8; ti++) {
         int t = types[ti];
         const bool coarse = ti == 3;
         size_t nb = inz_qmat_bytes(t, rows, cols);
@@ -40,7 +44,12 @@ int main(int argc, char **argv) {
         inz_qmat m[4];
         inz_quant_params p = {.type = t, .rot_block = -1, .lut_iters = 1};
         buf[0] = inz_aligned(64, nb);
-        inz_quantize(W, rows, cols, &p, buf[0]);
+        if (t == INZ_T_F8T) {
+            uint8_t *w8 = malloc((size_t)rows * cols);
+            for (size_t i = 0; i < (size_t)rows * cols; i++) { s = s * 6364136223846793005ull + 1; w8[i] = (uint8_t)(s >> 40) & 0x7E; }
+            inz_pack_f8t(w8, 0.01f, rows, cols, buf[0]);
+            free(w8);
+        } else inz_quantize(W, rows, cols, &p, buf[0]);
         for (int k = 1; k < 4; k++) { buf[k] = inz_aligned(64, nb); memcpy(buf[k], buf[0], nb); }
         for (int k = 0; k < 4; k++) { inz_qmat_view(&m[k], buf[k]); m[k].coarse = coarse; }
         const double rb = coarse ? (double)inz_q3p_coarse_bytes(rows, cols) : (double)nb;  // bytes actually read
@@ -51,7 +60,7 @@ int main(int argc, char **argv) {
         for (int grain = 16; grain <= 64; grain *= 2) {
             double t0 = inz_now();
             for (int r = 0; r < reps; r++) {
-                job j = {&m[r & 3], &a, y};
+                job j = {&m[r & 3], &a, x, y};
                 tp_for(tp, rows, grain, run, &j);
             }
             double el = inz_now() - t0;
