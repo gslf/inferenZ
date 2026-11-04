@@ -238,7 +238,13 @@ static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const flo
     }
     mm_job j = {W, X, ldx, n, Y, ldy, e->acts};
     const bool big_k = W->cols >= 6144;
-    const int grain = W->type != INZ_T_F32 && n > 1 && float_act(W->type) ? (big_k ? 12 : 24) : big_k ? 16 : 32;
+    int grain = W->type != INZ_T_F32 && n > 1 && float_act(W->type) ? (big_k ? 12 : 24) : big_k ? 16 : 32;
+    if (n > 32 && (W->type == INZ_T_F16 || W->type == INZ_T_F8T)) {
+        // many tokens: a task streams every token block once, so it should own many rows (fewer X passes), while
+        // leaving about 8 tasks per thread for the balance between P- and E-cores
+        const int g8 = W->rows / (8 * tp_size(e->tp));
+        grain = g8 > 128 ? 128 : g8 > grain ? g8 : grain;
+    }
     tp_for(e->tp, W->rows, grain, mm_task, &j);
 }
 

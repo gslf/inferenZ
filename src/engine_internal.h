@@ -62,7 +62,7 @@ typedef struct {
     uint16_t *k, *v;         // [Q_N_ATTN + 1][ctx][Q_KV] f16 (the last one is the MTP layer's)
 } q_state;
 
-#define Q_MAX_T 512          // tokens per forward call (prefill chunk)
+#define Q_MAX_T 2048          // tokens per forward call (prefill chunk)
 
 struct inz_engine {
     inz_opts opt;

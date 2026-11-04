@@ -1365,10 +1365,13 @@ void inz_matvec_f8t_rows(const inz_qmat *m, const float *x, float *y, int r0, in
 }
 
 void inz_matmul_f8t_rows(const inz_qmat *m, const float *X, int ldx, int n, float *Y, int ldy, int r0, int r1) {
-    static _Thread_local uint16_t buf[49152];  // decoded rows (96 KiB: stays in L2 while the tokens stream past)
+    // decoded rows, 1 MiB per thread: as many rows as fit share each block of tokens the F16 kernel streams
+    enum { BUF = 1 << 19 };
+    static _Thread_local uint16_t *buf;
+    if (!buf) buf = inz_aligned(64, sizeof(uint16_t) * BUF);
     const int K = m->cols;
     const float g = m->gscale * 256.0f;
-    const int chunk = (int)(sizeof(buf) / sizeof(buf[0])) / K;
+    const int chunk = BUF / K;
     if (chunk < 1) inz_die("f8t: %d columns exceed the decode buffer", K);
     for (int c0 = r0; c0 < r1; c0 += chunk) {
         const int cr = r1 - c0 < chunk ? r1 - c0 : chunk;
