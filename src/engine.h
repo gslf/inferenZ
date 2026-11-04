@@ -21,7 +21,7 @@ typedef struct {
     bool mlock;
     bool spec;                  // MTP speculative decoding (when the model has the MTP layer)
     int spec_k;                 // draft tokens per step (1..3)
-    int lookahead;              // decode: prefetch the experts the next layer's router predicts (0 = off)
+    int lookahead;              // decode: prefetch the experts the next MoE router predicts (1 late, 2 early, 0 off)
     const char *hotlist;        // expert warm-start scores file: path, "auto" or "off"
     const char *route_trace;    // write routing trace for offline cache simulation (optional)
     int verbose;

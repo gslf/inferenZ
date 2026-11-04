@@ -30,10 +30,10 @@ For each MoE block of a decode step:
 
 1. **Route** (sigmoid over 512, top-22 after a selection bias, renormalized, scaled by 5).
 2. **Issue demand reads** for the non-resident experts of this block.
-3. **Router lookahead** (`--lookahead 1`, default). This block's MoE input goes through the next MoE block's router. The predicted top-22 are queued as prefetches. It works because the residual stream changes slowly from block to block (Eliseev & Mazur 2023, SpecMD). The cost is one 512 × 4096 matvec per block.
-4. **Compute the latent projection and the shared expert** while the reads are in flight.
-5. **Compute available experts together**, including new arrivals, without waiting for every read.
-6. **Combine the results in a fixed order**, so arrival order does not change the answer.
+3. **Compute the latent projection and the shared expert** while the reads are in flight.
+4. **Compute available experts together**, including new arrivals, without waiting for every read.
+5. **Combine the results in a fixed order**, so arrival order does not change the answer.
+6. **Router lookahead** (`--lookahead 1`, default). The updated residual goes through the next MoE block's norm and router, and its top-22 are queued as prefetches while the Mamba or attention block in between runs. It works because the residual stream changes slowly from block to block (Eliseev & Mazur 2023, SpecMD). The cost is one 512 × 4096 matvec per block. Measured on the first nine blocks with half of their experts cached, it predicts 69% of the experts; `--lookahead 2` predicts from the MoE input instead, earlier but only 53% right, and was 6% slower.
 
 Per-layer timing, stall seconds, read latency histograms, lookahead precision and recall are all in the diagnostics.
 

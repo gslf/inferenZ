@@ -641,8 +641,9 @@ static void moe_block(inz_engine *e, const q_layer *L, int dl, int n, const floa
         for (int i = 0; i < nu; i++)
             if (!ec_is_resident(e->ec, l, units[i].expert)) { ec_request(e->ec, l, units[i].expert, 1.0f, EC_FULL); asked[i] = true; }
     const q_layer *Ln = next_moe(e, dl);
-    if (n <= EB_TOK && e->opt.lookahead > 0 && Ln && !e->ec_all_resident) {
-        // the residual drifts slowly: this block's MoE input through the next MoE block's router predicts its experts
+    if (n <= EB_TOK && e->opt.lookahead == 2 && Ln && !e->ec_all_resident) {
+        // early lookahead (--lookahead 2): this block's MoE input through the next MoE block's router predicts its
+        // experts; earlier but less precise than the late one (run_block)
         const uint64_t tl = diag_tsc();
         float *lg2 = e->tmp + (size_t)n * Q_N_EXPERT;
         lin_mm(e, &Ln->router, xin, Q_H, n, lg2, Q_N_EXPERT);
@@ -811,6 +812,28 @@ void q_state_reset(inz_engine *e) {
     e->mtp_valid = 0;
 }
 
+// Router lookahead (--lookahead 1, the default): once a MoE block has updated the residual, the next MoE block's own
+// norm and router on it predict that block's experts (only a Mamba or attention block lies in between), and they are
+// prefetched while that block runs. On the first blocks this predicts 69% of the experts against 53% for the early
+// lookahead from the MoE input, and the shorter lead time costs less than the extra precision gains.
+static void moe_lookahead_late(inz_engine *e, int dl, int n, const float *X) {
+    const q_layer *Ln = next_moe(e, dl);
+    if (!Ln || n > EB_TOK || !e->ec || e->ec_all_resident) return;
+    const uint64_t t0 = diag_tsc();
+    norm_rows(e, X, Q_H, n, e->Xn, Q_H, Ln->norm);
+    float *lg = e->tmp;
+    lin_mm(e, &Ln->router, e->Xn, Q_H, n, lg, Q_N_EXPERT);
+    for (int t = 0; t < n; t++) {
+        float ch[Q_N_EXPERT];
+        for (int x = 0; x < Q_N_EXPERT; x++) ch[x] = sigmoidf(lg[(size_t)t * Q_N_EXPERT + x]) + Ln->router_bias[x];
+        int32_t ps[Q_TOPK];
+        topk_f32(ch, Q_N_EXPERT, Q_TOPK, ps);
+        for (int k = 0; k < Q_TOPK; k++) ec_prefetch(e->ec, Ln->idx, ps[k], 0.75f, EC_FULL);
+        if (n == 1) { memcpy(e->pred[Ln->idx], ps, sizeof(ps)); e->pred_valid[Ln->idx] = true; g_diag.pred_total += Q_TOPK; }
+    }
+    diag_add(DG_PREFETCH, dl, t0, q_lin_bytes(&Ln->router), 0);
+}
+
 // one block on rows X [n][H]: X += mixer(rmsnorm(X) * norm); dl: block index for diagnostics
 static void run_block(inz_engine *e, const q_layer *L, int dl, int ai, int n, int p0, float *X) {
     uint64_t t0 = diag_tsc();
@@ -831,6 +854,7 @@ static void run_block(inz_engine *e, const q_layer *L, int dl, int ai, int n, in
         break;
     }
     add_rows(X, e->y, n);
+    if (L->kind == QB_MOE && e->opt.lookahead == 1) moe_lookahead_late(e, dl, n, X);
 }
 
 void q_forward(inz_engine *e, const int32_t *tokens, int n, const int *logits_rows, int n_logits, float *out_logits) {
