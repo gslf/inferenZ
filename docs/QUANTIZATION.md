@@ -1,54 +1,36 @@
-# Quantization
+# Weight formats
 
 [README](../README.md)
 
+To produce each token, the model reads gigabytes of weights from RAM, and on a laptop the speed of memory is the limit. Storing each weight in fewer bits means fewer bytes to read per token, faster generation, a smaller file, and more experts that fit in RAM. The price is precision.
 
-To produce each token, the model reads gigabytes of weights from RAM, and on a laptop the speed of memory is the limit. Storing each weight in fewer bits means fewer bytes to read per token, faster generation, a smaller file, and more experts that fit in RAM.
-
-The price is precision. A weight stored in 4 bits is only an approximation of the original. The error has to stay small enough not to change what the model writes. inferenZ measures it for every recipe, by comparing its predictions with those of the official model.
+Nemotron 3.5 Super is published already quantized: NVIDIA trained the NVFP4 release by distillation from the BF16 weights, and its published benchmarks match them. inferenZ therefore keeps every published number exactly. There is no recipe to choose and nothing to calibrate: the engine runs the model NVIDIA released.
 
 ## The formats
 
-Weights are stored in groups of 64. In the quantized formats, each group shares one scale factor, and each weight in the group is stored with a few bits.
-
 | Format | Bits per weight | What it is | Used for |
 |---|---:|---|---|
-| F32 | 32 | exact | small tensors that control gates and decay rates |
-| F16 | 16 | exact: holds the original weights without loss | the exact recipe |
-| FP8 | 8 | the original 8-bit format, kept as is | the n-gram table |
-| Q8G | 8.25 | 8-bit integers | dense weights in the recommended recipe, experts in the exact one |
-| Q4L | 4.25 | 4-bit index into a table of 16 levels | experts in the recommended recipe |
-| Q3L, Q2L | 3.25, 2.25 | 3- and 2-bit versions of Q4L | available, not used by either recipe |
+| Q4N | 4.5 | NVFP4 repacked without changing a value: 4-bit codes (e2m1), one 8-bit scale per 16 weights, one scale per matrix | routed and shared experts |
+| F8T | 8 | FP8 (e4m3) copied as is, one scale per matrix | Mamba and attention projections, LM head |
+| F16 | 16 | the BF16 originals widened (F16 has more mantissa bits; only magnitudes below 6·10⁻⁵ lose relative precision, by less than 3·10⁻⁸) | router, latent projections, MTP projections, embeddings |
+| F32 | 32 | exact | norms, convolutions, step sizes |
 
-## Three ideas that keep the error small
+The LUT formats of the engine (Q8G, Q4L, Q3L, Q2L, with rotation, learned levels and importance weighting) remain available to `inz convert` for studies, but the default conversion does not use them.
 
-**Rotation.** Some inputs of a layer carry a few very large values. In a group that contains one, the shared scale has to be large, and every other weight in the group loses precision. Before quantizing, the weights are rotated with a fixed pseudo-random transform that spreads those large values evenly over the group. At run time the input of the layer is rotated the same way, so the result does not change.
+## How the kernels read the exact formats
 
-**Learned levels.** A 4-bit weight can take 16 values. Instead of spacing them evenly, the converter chooses them for each tensor, to fit how its weights are actually distributed: more levels where weights are frequent, fewer at the extremes.
+**Q4N.** A 4-bit code selects one of 16 values with a single PSHUFB, and AVX-VNNI multiplies 32 of them by the int8 input in one instruction. Every 4 weights of a 16-weight block share a 32-bit lane, so each lane is scaled by its block's e4m3 scale. The scale is decoded by moving its bits into an fp16 number: exact for zero and subnormal scales too, which the checkpoint contains.
 
-**Importance.** Not all inputs matter equally. The engine can run the model on a sample text and record how strongly each input is used; the converter then spends more precision where it matters (an *importance matrix*). This adds no work during generation. An experimental 8-bit scale refinement was removed after it worsened answers: see the [comparison](ANALISI-2026-10-25.md).
+**F8T.** Sixteen e4m3 bytes become sixteen fp16 bit patterns with three integer instructions (`(b << 8) >> 1`, arithmetic, then a mask): the same numbers divided by 2⁸, subnormals included. The CPU converts them to f32 and multiplies them by the f32 input, so the result is exact up to f32 rounding. The input is not quantized. One P-core reads 19 GB/s of FP8 weights, so ten cores outrun the RAM.
 
-## Why decoding is cheap
+**Bit-identical decode and verify.** A row of an F8T matrix is summed in the same order whether one token or several are computed, so speculative verification gives the same logits as plain decoding.
 
-The table of levels is so small that the CPU looks up 32 weights with a single instruction, and multiplies them by the layer's input with another (the AVX-VNNI instructions of recent x86 CPUs). Turning a 4-bit weight back into a number therefore costs almost nothing: the speed is set by how fast memory delivers the bytes. On the reference laptop, the 4-bit kernel reads weights at 74 GB/s, close to the RAM's peak of 77 GB/s.
+## Prompts use other kernels
 
-## The LM head in two stages
+Generating a token is limited by memory, because each weight is used once. Reading a prompt is limited by computation, because each weight is used for every token of the prompt. For 12 tokens or more:
+- Q4N matrices are converted, a tile at a time, to 8-bit integers and multiplied by several tokens with VNNI;
+- F8T matrices are converted, a few rows at a time, to F16 and multiplied by blocks of tokens with FMA.
 
-To pick each token, the model scores all 248,320 tokens of its vocabulary, which means reading 1.27 GB of weights at full precision. Most of those tokens are obviously wrong, so computing them exactly is wasted work. inferenZ works in two stages:
-1. a 4-bit copy of the head (0.34 GB) gives every token a rough score;
-2. the tokens whose rough score is close to the best one, about 240 of them, are recomputed exactly from the full-precision weights;
-3. the other tokens keep their rough score, slightly lowered so that, together, they do not get more probability than they should.
+## Precision of the activations
 
-This remains an approximation: the rough scores can miss a candidate. Selection is bounded and always keeps the best rough scores when too many qualify. `--exact-head` scores the whole vocabulary directly, at a higher cost.
-
-## Prompts use a different kernel
-
-Generating a token is limited by memory, because each weight is used once. Reading a prompt is limited by computation, because each weight is used for every token of the prompt. For 12 tokens or more, inferenZ converts blocks of weights to plain 8-bit integers once and multiplies them by several tokens at a time. On the reference laptop this reaches 1.2 to 2.3 trillion operations per second, up to about half of what the CPU can do.
-
-## Choosing the recipe
-
-The measurements on the full model (see the [README](../README.md#get-the-model-and-convert-it)) led to one rule:
-- **4-bit experts** cost little;
-- **4-bit dense weights cost much more**, above all the attention projections, which are the most sensitive weights of the model.
-
-The recommended recipe therefore keeps every dense weight at 8 bits and stores the experts at 4 bits: a 124 GB file. This recipe measured KL 0.014 against the official model and matched its top prediction 96.8% of the time.
+The activations stay f32 between operators. Q4N matrices quantize their input to int8 with one scale per 64 values; F8T, F16 and F32 matrices use the f32 input directly. NVIDIA's own serving on Blackwell GPUs quantizes the activations to 4 bits (NVFP4) or 8 bits (FP8), so inferenZ computes with more precision than the deployment the model was tuned for.

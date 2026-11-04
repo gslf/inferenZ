@@ -17,8 +17,8 @@ The request is standard OpenAI chat. Supported fields:
 |---|---|
 | `messages` | `system`, `developer`, `user`, `assistant` (with `reasoning_content` / `tool_calls`), `tool` |
 | `tools` | OpenAI function tools, rendered into the model's tool prompt |
-| `reasoning_effort` | `high` (default; the template's `xhigh`), `medium`, `low`, or `none` to disable thinking. Also `reasoning.effort` |
-| `temperature`, `top_p`, `top_k`, `min_p` | defaults 1.0 / 0.95 / 20 / off, from the model's `generation_config.json` |
+| `reasoning_effort` | `high` (default: thinking on), `medium` or `low` (the template's efficient thinking), or `none` to disable thinking. Also `reasoning.effort` |
+| `temperature`, `top_p`, `top_k`, `min_p` | defaults 1.0 / 0.95 / off / off, from the model's `generation_config.json` (top-p over the whole vocabulary) |
 | `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `seed` | |
 | `max_tokens` / `max_completion_tokens` | default 32768 (thinking at high effort can be long) |
 | `stop` | string or array |
@@ -44,7 +44,7 @@ Every response, streamed or not, ends with a `timings` object (an inferenZ exten
 
 The engine keeps the state of the previous request. Chat clients resend the whole history, so the new request usually extends the old one; then only the new tokens are processed.
 
-The attention caches are positional and are simply truncated. The recurrent DeltaNet state cannot be rewound token by token. It is therefore checkpointed before the last prompt token of every request, and a request that diverges after that point restarts from the checkpoint. Any other divergence recomputes the prompt.
+The attention caches are positional and are simply truncated. The recurrent Mamba-2 state cannot be rewound token by token. It is therefore checkpointed before the last prompt token of every request, and a request that diverges after that point restarts from the checkpoint. Any other divergence recomputes the prompt.
 
 ## Tools
 
@@ -56,7 +56,7 @@ Raw text completion: `prompt` is tokenized as-is, with special tokens recognized
 
 ## `GET /v1/models`
 
-Returns the single model id (`qwen3.8-flash-next`).
+Returns the single model id (`nemotron-3.5-super`).
 
 ## Diagnostics
 

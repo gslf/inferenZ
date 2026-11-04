@@ -1100,8 +1100,10 @@ static void mm_q4n(const inz_qmat *m, const inz_act *acts, int nt, float *Y, int
                     const __m256i x1 = _mm256_load_si256((const __m256i *)(a->q + g * 64 + 32));
                     const __m256i i0 = dot_u8s8(_mm256_load_si256((const __m256i *)(a->nb4 + g * 16)), u0, x0);
                     const __m256i i1 = dot_u8s8(_mm256_load_si256((const __m256i *)(a->nb4 + g * 16 + 8)), u1, x1);
-                    const __m256 part = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1), S1, _mm256_mul_ps(_mm256_cvtepi32_ps(i0), S0));
-                    acc[t] = _mm256_fmadd_ps(part, _mm256_set1_ps(a->s[g]), acc[t]);
+                    // the matvec's operations in the matvec's order: one token gets the same bits either way
+                    const __m256 xs = _mm256_set1_ps(a->s[g]);
+                    acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i0), _mm256_mul_ps(S0, xs), acc[t]);
+                    acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(i1), _mm256_mul_ps(S1, xs), acc[t]);
                 }
             }
             for (int t = 0; t < tn; t++) Y[(size_t)(t0 + t) * ldy + r] = hsum8(acc[t]) * (m->gscale * 256.0f);

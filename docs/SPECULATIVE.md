@@ -2,27 +2,29 @@
 
 [README](../README.md)
 
-Decoding one token reads every dense weight and ten experts per layer. On a CPU that is a memory-bandwidth cost, nearly independent of how many tokens are checked at once. Qwen3.8-Flash-Next ships a multi-token-prediction (MTP) layer trained to guess the token after next. inferenZ uses it to draft tokens and verifies them with the main model in one batched pass.
+Decoding one token reads every dense weight and 22 experts per MoE block. On a CPU that is a memory-bandwidth cost, nearly independent of how many tokens are checked at once. Nemotron 3.5 Super ships a multi-token-prediction (MTP) head trained to guess the token after next. inferenZ uses it to draft tokens and verifies them with the main model in one batched pass.
 
-## The MTP layer
+## The MTP head
 
-One QSA attention + MoE decoder layer with its own hyper-connection mixer. It shares the embeddings and the LM head with the main model. Its input combines the main model's residual at position `p` with the embedding of the token at `p + 1`, and it predicts the token at `p + 2`:
+One attention block and one MoE block, as in the main model, with a final norm. It shares the embeddings and the LM head with the main model. Its input combines the main model's final hidden state at position `p` with the embedding of the token at `p + 1`, and it predicts the token at `p + 2`. transformers does not implement it; inferenZ follows vLLM:
 
 ```
-X   = [fc_hidden · norm(X_main_p,s)]_s + fc_embedding · norm(embed[t_p+1])     (all 4 streams)
-X   = mtp_layer(X);  logits = lm_head · mtp_mixer(X)
+h   = norm_f(x_main_p)
+X   = eh_proj · [enorm(embed[t_p+1]) | hnorm(h)]
+X   = X + attention(norm(X));  X = X + moe(norm(X))
+logits = lm_head · final_norm(X)
 ```
 
 The MTP attention has its own cache, one slot per position. Slot `p` needs the token at `p + 1`, so the MTP cache always runs one position behind the main one:
 - **prefill:** after each prompt chunk, the slots whose next token is known are filled in one batch;
 - **decode:** each step fills the pending slots and drafts from the newest one in a single MTP call.
 
-The MTP layer's experts live in the same SSD-backed cache as the others, as layer 48.
+The MTP block's experts live in the same SSD-backed cache as the others, as MoE layer 40.
 
 ## One step
 
 1. **Token.** `tok` is the token sampled at the previous step, at position P.
-2. **Draft.** The MTP layer fills its pending slots (P − m … P − 1, the last one with `tok`) and drafts `d0`. With `--spec-k` 2 or 3, further MTP steps continue from its newest output to draft `d1` and `d2`.
+2. **Draft.** The MTP layer fills its pending slots (P − m … P − 1, the last one with `tok`) and drafts `d0`. With `--spec-k` 2 or 3, further MTP steps continue from its newest output (after `final_norm`) to draft `d1` and `d2`.
 3. **Verify.** One pass of the main model over `[tok, d0 … d(k−1)]`, at positions P … P + k, gives the logits of every row.
 4. **Accept.** Speculative sampling decides, position by position, which drafts to keep.
 5. **Rewind.** If a draft is rejected, the recurrent state goes back to the snapshot taken after the last accepted token.

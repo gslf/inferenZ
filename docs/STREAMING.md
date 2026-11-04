@@ -2,13 +2,9 @@
 
 [README](../README.md)
 
-The routed experts of Qwen3.8-Flash-Next are 121B of its 125B parameters (plus 2.5B in the MTP layer): 512 experts in each of 48 layers, top-10 per token. Stored as Q8G that is 125 GB of 4.8 MiB blobs, as Q4L 64 GB.
+The routed experts of Nemotron 3.5 Super are 113B of its 120B parameters (plus 2.8B in the MTP block): 512 experts in each of 40 MoE blocks, top-22 per token. In NVFP4 (Q4N) that is 63.5 GB of 2.96 MiB blobs.
 
-The converter writes each expert as one contiguous **blob**, the gate|up matrix (1280 × 2560) followed by the down matrix (2560 × 640). Its size depends on the format:
-
-| Format | F16 | Q8G | Q4L | Q3L |
-|---|---:|---:|---:|---:|
-| Blob size | 9.4 MiB | 4.8 MiB | 2.5 MiB | 1.9 MiB |
+The converter writes each expert as one contiguous **blob**, the up matrix (2688 × 1024) followed by the down matrix (1024 × 2688), both in the latent space of the LatentMoE.
 
 - Each blob is padded to 4 KiB, and the GGUF alignment is 4 KiB, so every blob can be read with a single `O_DIRECT` request straight into its cache slot.
 - Large reads are where the drive delivers its bandwidth.
@@ -19,7 +15,7 @@ The model directory should be `chattr +C` on btrfs (no copy-on-write, no compres
 ## The cache
 
 - **Arena.** One anonymous, huge-page-advised arena divided into fixed slots of one blob each. The budget is automatic: the engine's whole footprint stays within `MemTotal − reserve` (and within what is free), or `--cache 40G`. The reserve (`--ram-reserve`, default max(10 GB, 30% of RAM)) keeps the desktop and the page cache out of swap.
-- **One cache for all layers.** The 48 layers and the MTP layer (index 48) share the slots.
+- **One cache for all layers.** The 40 MoE blocks and the MTP MoE block (index 40) share the slots.
 - **I/O.** Reads go through `io_uring` with a registered file. Fixed buffers are used when `RLIMIT_MEMLOCK` allows; optional SQPOLL can be pinned to a low-power core.
 - **Two queues.** *Demand* reads (a layer is waiting) are always submitted before *prefetch* reads.
 - **Eviction (LRFU).** Each expert keeps a decayed-frequency score `crf = crf·2^(−λΔt) + w`, where `w` is an access weight and `Δt` counts tokens processed by the main model. λ moves it between LFU and LRU. Scores survive eviction, so frequency is remembered. Default `λ = 0.01` (half-life 100 tokens).
@@ -30,12 +26,12 @@ The model directory should be `chattr +C` on btrfs (no copy-on-write, no compres
 
 ## Hiding the SSD behind compute
 
-For each MoE layer of a decode step:
+For each MoE block of a decode step:
 
-1. **Route** (softmax over 512, top-10, renormalized).
-2. **Issue demand reads** for the non-resident experts of this layer.
-3. **Router lookahead** (`--lookahead 1`, default). This layer's MoE input goes through the next layer's router. The predicted top-10 are queued as prefetches. It works because the residual stream changes slowly from layer to layer (Eliseev & Mazur 2023, SpecMD). The cost is one 512 × 2560 matvec per layer.
-4. **Compute the shared expert** while the reads are in flight.
+1. **Route** (sigmoid over 512, top-22 after a selection bias, renormalized, scaled by 5).
+2. **Issue demand reads** for the non-resident experts of this block.
+3. **Router lookahead** (`--lookahead 1`, default). This block's MoE input goes through the next MoE block's router. The predicted top-22 are queued as prefetches. It works because the residual stream changes slowly from block to block (Eliseev & Mazur 2023, SpecMD). The cost is one 512 × 4096 matvec per block.
+4. **Compute the latent projection and the shared expert** while the reads are in flight.
 5. **Compute available experts together**, including new arrivals, without waiting for every read.
 6. **Combine the results in a fixed order**, so arrival order does not change the answer.
 
@@ -47,7 +43,7 @@ Prefill processes the prompt in chunks of up to 512 tokens. For each layer:
 - tokens are grouped by expert (expert-major);
 - each expert is read once per chunk and applied to all of its tokens.
 
-Short prompts are the hard case. With top-10 of 512, 100 tokens already touch 512 · (1 − (502/512)^100) ≈ 440 distinct experts per layer, each for a token or two. A short prompt is therefore bound by the SSD unless most experts are resident.
+Short prompts are the hard case. With top-22 of 512, 100 tokens already touch 512 · (1 − (490/512)^100) ≈ 506 distinct experts per block, each for a token or a few. A short prompt is therefore bound by the SSD unless most experts are resident.
 
 ## Routing traces
 

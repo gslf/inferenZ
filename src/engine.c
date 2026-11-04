@@ -279,6 +279,7 @@ static void setup_experts(inz_engine *e, uint64_t other_bytes) {
     if (e->up_bytes + inz_mat_bytes(e->expert_type, Q_LAT, Q_FF) > e->blob_bytes || e->blob_bytes % 4096)
         inz_die("model: expert blob size %llu does not fit type %s", (unsigned long long)e->blob_bytes, inz_qtype_name(e->expert_type));
     const int nl = e->n_moe + (e->mtp.present ? 1 : 0);  // the MTP layer's experts are layer n_moe
+    if (!nl) return;                                     // a truncated test model without MoE blocks
     uint64_t *off = inz_malloc(sizeof(uint64_t) * (size_t)nl * Q_N_EXPERT);
     for (int l = 0; l < nl; l++) {
         char name[64];
