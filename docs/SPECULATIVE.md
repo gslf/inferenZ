@@ -43,3 +43,7 @@ A draft `d ~ q` (the MTP distribution after the same temperature, top-k, top-p a
 | request field `"speculative": false` | plain decoding for one request (the MTP cache is still maintained) |
 
 The monitor shows tokens drafted and accepted, and the accepted tokens per verify step.
+
+## Measured
+
+Reference laptop, warm cache, greedy, 5 prompts × 256 tokens: 3.95 tok/s plain, 4.71 tok/s with `--spec-k 1` (91% of drafts accepted). A verify pass of two tokens costs 1.5× a decode step, mostly because the second token routes to other experts (up to 44 per block instead of 22). `--spec-k 2` was 3–6% faster than 1 on code and prose; `--spec-k 3` was slower on prose. The MTP logits match the reference (vLLM's MTP structure over the official transformers blocks, official weights) within KL 0.0026, top-1 98%.

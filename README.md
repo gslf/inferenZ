@@ -49,6 +49,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
   -d '{"messages":[{"role":"user","content":"Ciao!"}],"reasoning_effort":"medium"}'
 ```
 
+### Speed on the reference laptop
+
+Core Ultra 7 265U, 62 GB, warm expert cache: 3.95 tok/s plain, 4.71 tok/s with MTP, prefill 16.5 tok/s on a 3.8k-token prompt. Qwen3.8-Flash-Next on `main` is about twice as fast ([comparison](docs/COMPARISON.md)).
+
 ### Memory
 
 The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM) to the rest of the system. If the minimum cache does not fit, startup stops with a clear error.
@@ -60,6 +64,7 @@ The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM
 
 ## References
 
+- **Nemotron 3.5 Super vs Qwen3.8-Flash-Next** (the `main` branch): speed, accuracy and coding quality on the same laptop. [docs/COMPARISON.md](docs/COMPARISON.md)
 - **Architecture overview.** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Diagnostics.** [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)
 - **OpenAI-compatible API**: chat (reasoning, tools, streaming), completions. [docs/API.md](docs/API.md)
@@ -80,7 +85,7 @@ python3 -I tools/hfget.py nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 mo
 ./inz convert --src models/Nemotron-3.5-Super-VL-NVFP4 --out models/nemotron-3.5-super.inz.gguf
 ```
 
-The conversion copies every tensor exactly (NVFP4 → Q4N, FP8 → F8T, BF16 → F16) into a 74 GB file.
+The conversion copies every tensor exactly (NVFP4 → Q4N, FP8 → F8T, BF16 → F16) into a 73 GB file.
 
 
 

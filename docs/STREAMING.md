@@ -37,6 +37,8 @@ For each MoE block of a decode step:
 
 Per-layer timing, stall seconds, read latency histograms, lookahead precision and recall are all in the diagnostics.
 
+On the reference laptop (62 GB, default reserve) the cache holds 32.8 GiB, 54% of the experts. After a warm start, the benchmark prompts hit the cache 85% of the time (91% in the last minutes), and the lookahead predicted 77% of the experts.
+
 ## Prefill
 
 Prefill processes the prompt in chunks of up to 512 tokens. For each layer:
