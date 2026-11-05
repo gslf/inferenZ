@@ -9,7 +9,10 @@ Masks (causal, and the 512-position sliding window) and the per-layer-type RoPE 
 with the official mask functions and rotary module.
 
     tvenv/bin/python -I tests/ref_laguna.py --src models/Laguna-S-2.1-NVFP4 --tokens 1,2,3 --layers 48 --out ref.npy \
-        [--dump-hidden hidden.f32] [--last N]
+        [--dump-hidden hidden.f32] [--last N] [--act f32|int8|nvfp4]
+
+--act int8 quantizes the routed experts' inputs as the engine does, --act nvfp4 as the checkpoint's W4A4 serving does
+(layers 1-39), to tell the engine's own error from that of its activation format.
 
 Outputs: logits [T or last N, vocab] float32 (.npy); with --dump-hidden, the residual stream after every layer,
 float32 [L][T][3072].
@@ -100,13 +103,34 @@ class ST:
         return torch.from_numpy(a.astype(np.float32) if a.dtype != np.int64 else a.copy())
 
 
+def act_int8(x, group=64):
+    """The engine's activation quantization: int8, one scale (max |x| / 127) per group of 64, round to nearest even."""
+    g = x.reshape(-1, group)
+    s = g.abs().amax(-1, keepdim=True) / 127
+    return (torch.round(g / torch.where(s > 0, s, 1)) * s).reshape(x.shape)
+
+
+E2M1_POS = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+
+
+def act_nvfp4(x, global_scale):
+    """The checkpoint's own activation format (W4A4 serving): e2m1, one e4m3 scale per 16 inputs, a static global
+    scale per projection; dequantized e2m1 * scale / global."""
+    g = x.reshape(-1, 16)
+    s = (g.abs().amax(-1, keepdim=True) / 6 * global_scale).clamp(max=448).to(torch.float8_e4m3fn).float()
+    v = (g * global_scale / torch.where(s > 0, s, 1)).clamp(-6, 6)
+    q = E2M1_POS[(v.abs().unsqueeze(-1) - E2M1_POS).abs().argmin(-1)] * v.sign()
+    return (q * s / global_scale).reshape(x.shape)
+
+
 class LazyExperts(nn.Module):
     """LagunaExperts whose weights are read (and dequantized) only for the experts a batch hits. The forward is the
-    official one line by line; only the weight lookup differs."""
+    official one line by line; only the weight lookup differs (and, with --act-int8, the engine's int8 inputs)."""
 
-    def __init__(self, st, base, num_experts, act_fn):
+    def __init__(self, st, base, num_experts, act_fn, q=None):
         super().__init__()
         self.st, self.base, self.num_experts, self.act_fn = st, base, num_experts, act_fn
+        self.q = q or (lambda x, name: x)
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final_hidden_states = torch.zeros_like(hidden_states)
@@ -122,9 +146,10 @@ class LazyExperts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
             gate_up = torch.cat([self.st.tensor(f"{self.base}{e}.gate_proj.weight"), self.st.tensor(f"{self.base}{e}.up_proj.weight")], 0)
-            gate, up = nn.functional.linear(current_state, gate_up).chunk(2, dim=-1)
+            gate, up = nn.functional.linear(self.q(current_state, f"{self.base}{e}.gate_proj"), gate_up).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.st.tensor(f"{self.base}{e}.down_proj.weight"))
+            current_hidden_states = nn.functional.linear(self.q(current_hidden_states, f"{self.base}{e}.down_proj"),
+                                                         self.st.tensor(f"{self.base}{e}.down_proj.weight"))
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
         return final_hidden_states
@@ -157,6 +182,8 @@ def main():
     ap.add_argument("--last", type=int, default=0)
     ap.add_argument("--dump-hidden", default=None)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--act", choices=["f32", "int8", "nvfp4"], default="f32",
+                    help="routed experts' inputs: exact, the engine's int8, or the checkpoint's NVFP4 (W4A4 serving)")
     a = ap.parse_args()
     if a.threads:
         torch.set_num_threads(a.threads)
@@ -190,7 +217,12 @@ def main():
         with torch.device("meta"):
             layer = M.LagunaDecoderLayer(config, l)
         if config.mlp_layer_types[l] == "sparse":
-            layer.mlp.experts = LazyExperts(st, f"{P}layers.{l}.mlp.experts.", config.num_experts, M.ACT2FN[config.hidden_act])
+            q = None
+            if a.act == "int8":
+                q = lambda x, name: act_int8(x)
+            elif a.act == "nvfp4" and st.has(f"{P}layers.{l}.mlp.experts.0.down_proj.input_global_scale"):
+                q = lambda x, name: act_nvfp4(x, st.tensor(name + ".input_global_scale").item())
+            layer.mlp.experts = LazyExperts(st, f"{P}layers.{l}.mlp.experts.", config.num_experts, M.ACT2FN[config.hidden_act], q)
         layer = layer.to_empty(device="cpu")
         load_weights(st, layer, f"{P}layers.{l}.")
         layer.eval()

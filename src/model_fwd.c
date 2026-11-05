@@ -5,6 +5,7 @@
 // chunk.
 #define _GNU_SOURCE
 #include <immintrin.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,6 +203,9 @@ void q_imx_write(inz_engine *e) {
     LOGI("imatrix: %u entries written to %s", count, e->imx_path);
 }
 
+static void mm_group_run(inz_engine *e, const lin *const *W, float *const *Y, const int *ldy, int nw, const float *X, int ldx,
+                         int n, const inz_qmat *qm, bool quantize);
+
 // Y[t*ldy + r] = W[r] . X[t*ldx]  for t < n, r < W->rows. `prev`: the matrix run just before on the same input,
 // whose quantized activation can be reused.
 static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const float *X, int ldx, int n, float *Y, int ldy) {
@@ -209,6 +213,13 @@ static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const flo
         imx_entry *x = &e->imx[W->imx - 1];
         imx_add(x->acc, X, ldx, n, W->cols);
         x->n += (uint64_t)n;
+    }
+    if (n == 1 && !W->imx) {
+        const inz_qmat *qm = float_act(W->type) ? NULL : &W->q;
+        const bool reuse = qm && prev && !float_act(prev->type) && prev->cols == W->cols && prev->q.rot_block == qm->rot_block &&
+                           prev->q.rot_seed == qm->rot_seed;
+        mm_group_run(e, &W, &Y, &ldy, 1, X, ldx, n, qm, !reuse);
+        return;
     }
     if (!float_act(W->type)) {
         const inz_qmat *m = &W->q;
@@ -243,6 +254,89 @@ static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const flo
 
 static void lin_mm(inz_engine *e, const lin *W, const float *X, int ldx, int n, float *Y, int ldy) {
     lin_mm_after(e, W, NULL, X, ldx, n, Y, ldy);
+}
+
+// Several matrices on the same input in one dispatch, for a few tokens: one wake-up of the pool instead of one per
+// matrix, and the small matrices stream at the big one's bandwidth. For one token the input is quantized by the
+// same dispatch: its first tasks quantize slices of it in parallel (the previous kernels' threads hold its cache
+// lines, which a single thread would fetch one by one), the others wait for them and then run rows.
+#define MMG_MAX 4
+#define MMG_SLICE 256
+typedef struct {
+    mm_job j[MMG_MAX];
+    int start[MMG_MAX + 1], rows[MMG_MAX];   // first row block and rows per block of each matrix (after the slices)
+    int nq;                                  // quantization slices
+    inz_act *a;
+    const float *x;
+    atomic_int qleft;
+} mmg_job;
+
+static void mmg_task(void *ctx, int64_t b, int64_t e_, int tid) {
+    mmg_job *g = ctx;
+    for (int64_t k = b; k < e_; k++) {
+        if (k < g->nq) {
+            inz_act_quantize_part(g->a, g->x, (int)k * MMG_SLICE, (int)(k + 1) * MMG_SLICE);
+            atomic_fetch_sub_explicit(&g->qleft, 1, memory_order_release);
+            continue;
+        }
+        // slices are handed out first, so every one still pending is held by a running thread
+        while (atomic_load_explicit(&g->qleft, memory_order_acquire) > 0) _mm_pause();
+        const int64_t kb = k - g->nq;
+        int w = 0;
+        while (kb >= g->start[w + 1]) w++;
+        const int r0 = (int)(kb - g->start[w]) * g->rows[w], rows = g->j[w].W->rows;
+        mm_task(&g->j[w], r0, r0 + g->rows[w] < rows ? r0 + g->rows[w] : rows, tid);
+    }
+}
+
+// whether the group can run as one dispatch: no importance matrix, same input width, one rotation for the quantized
+static bool mm_groupable(const lin *const *W, int nw, int n, const inz_qmat **qm) {
+    *qm = NULL;
+    if (n >= GEMM_MIN_T || nw > MMG_MAX) return false;
+    for (int i = 0; i < nw; i++) {
+        if (W[i]->imx || W[i]->cols != W[0]->cols) return false;
+        if (float_act(W[i]->type)) continue;
+        if (!*qm) *qm = &W[i]->q;
+        else if (W[i]->q.rot_block != (*qm)->rot_block || W[i]->q.rot_seed != (*qm)->rot_seed) return false;
+    }
+    return true;
+}
+
+// quantize: whether the input still has to be quantized (false when the previous matrix left it in e->acts)
+static void mm_group_run(inz_engine *e, const lin *const *W, float *const *Y, const int *ldy, int nw, const float *X, int ldx,
+                         int n, const inz_qmat *qm, bool quantize) {
+    mmg_job g;
+    g.nq = 0;
+    if (qm && quantize) {
+        const int K = W[0]->cols;
+        if (n == 1 && K % MMG_SLICE == 0 && qm->rot_block <= MMG_SLICE) {
+            inz_act_begin(&e->acts[0], K, qm->rot_block, qm->rot_seed);
+            g.nq = K / MMG_SLICE;
+        } else {
+            aq_job aj = {e->acts, X, ldx, K, qm->rot_block, qm->rot_seed};
+            tp_for(e->tp, n, 1, aq_task, &aj);
+        }
+    }
+    g.a = &e->acts[0];
+    g.x = X;
+    atomic_init(&g.qleft, g.nq);
+    g.start[0] = 0;
+    for (int i = 0; i < nw; i++) {
+        g.j[i] = (mm_job){W[i], X, ldx, n, Y[i], ldy[i], e->acts};
+        g.rows[i] = W[i]->cols >= 6144 ? 16 : 32;
+        g.start[i + 1] = g.start[i] + (W[i]->rows + g.rows[i] - 1) / g.rows[i];
+    }
+    tp_for(e->tp, g.nq + g.start[nw], 1, mmg_task, &g);
+}
+
+static void lin_mm_group(inz_engine *e, const lin *const *W, float *const *Y, const int *ldy, int nw, const float *X, int ldx,
+                         int n) {
+    const inz_qmat *qm;
+    if (!mm_groupable(W, nw, n, &qm)) {
+        for (int i = 0; i < nw; i++) lin_mm_after(e, W[i], i ? W[i - 1] : NULL, X, ldx, n, Y[i], ldy[i]);
+        return;
+    }
+    mm_group_run(e, W, Y, ldy, nw, X, ldx, n, qm, true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -379,10 +473,10 @@ static void attn_block(inz_engine *e, const q_layer *L, int l, int n, int p0, co
     const int nh = L->nh, qd = nh * Q_HD;
     float *q = e->big, *att = e->big + (size_t)Q_MAX_T * Q_QD_MAX;  // [n][nh*128] each
     float *k = e->tmp, *v = e->tmp + (size_t)Q_MAX_T * Q_KV, *g = e->tmp2;  // [n][1024], [n][1024], [n][nh]
-    lin_mm(e, &L->at_q, xin, Q_H, n, q, qd);
-    lin_mm_after(e, &L->at_k, &L->at_q, xin, Q_H, n, k, Q_KV);
-    lin_mm_after(e, &L->at_v, &L->at_k, xin, Q_H, n, v, Q_KV);
-    lin_mm_after(e, &L->at_g, &L->at_v, xin, Q_H, n, g, nh);
+    const lin *W[4] = {&L->at_q, &L->at_k, &L->at_v, &L->at_g};
+    float *Y[4] = {q, k, v, g};
+    const int ldy[4] = {qd, Q_KV, Q_KV, nh};
+    lin_mm_group(e, W, Y, ldy, 4, xin, Q_H, n);
     const bool full = q_is_full(l);
     const float *inv = full ? e->rope_full : e->rope_swa;
     const int rd = full ? Q_ROPE_FULL_DIM : Q_HD;
@@ -475,7 +569,7 @@ typedef struct {
 
 typedef struct { inz_engine *e; ebatch_item *it; int ni; } ebatch_job;
 
-#define EB_CHUNK 16
+#define EB_CHUNK 64  // rows per call: the kernels prefetch the next rows within a call
 static void eb_gu_task(void *ctx, int64_t b, int64_t e_, int tid) {
     (void)tid;
     ebatch_job *j = ctx;
@@ -551,9 +645,9 @@ static void experts_batch(inz_engine *e, const q_xclass *xc, const unit *const *
     }
     if (!ni) return;
     ebatch_job j = {e, it, ni};
-    tp_for(e->tp, (int64_t)ni * (2 * Q_FF / EB_CHUNK), 4, eb_gu_task, &j);
+    tp_for(e->tp, (int64_t)ni * (2 * Q_FF / EB_CHUNK), 1, eb_gu_task, &j);
     tp_for(e->tp, ni, 1, eb_act_task, &j);
-    tp_for(e->tp, (int64_t)ni * (Q_H / EB_CHUNK), 8, eb_down_task, &j);
+    tp_for(e->tp, (int64_t)ni * (Q_H / EB_CHUNK), 2, eb_down_task, &j);
 }
 
 // top-10 by sigmoid score + selection bias; weights are the chosen scores, normalized and scaled by 2.5

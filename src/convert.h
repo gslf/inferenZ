@@ -17,6 +17,7 @@ typedef struct {
     int t_router;         // MoE router
     int t_head, t_embed;
     int max_layers;    // truncate (for tests)
+    bool dense_only;   // no experts: a file of dense tensors for INZ_OVERRIDE studies
     const char *imatrix;  // importance matrix (INZ_IMATRIX=file inz dump ...): weights the quantization error
     int threads;
 } convert_opts;

@@ -250,11 +250,13 @@ static int cmd_convert(int argc, char **argv) {
         {"experts-bf16", required_argument, 0, 2}, {"attn", required_argument, 0, 3}, {"shared", required_argument, 0, 4},
         {"router", required_argument, 0, 5}, {"dense", required_argument, 0, 6}, {"head", required_argument, 0, 7},
         {"embed", required_argument, 0, 12}, {"layers", required_argument, 0, 8},
-        {"imatrix", required_argument, 0, 14}, {"threads", required_argument, 0, 't'}, {"verbose", no_argument, 0, 'v'}, {0, 0, 0, 0}};
+        {"imatrix", required_argument, 0, 14}, {"dense-only", no_argument, 0, 15}, {"threads", required_argument, 0, 't'},
+        {"verbose", no_argument, 0, 'v'}, {0, 0, 0, 0}};
     int ch;
     optind = 1;
     while ((ch = getopt_long(argc, argv, "s:o:t:v", lo, NULL)) != -1) {
         switch (ch) {
+        case 15: o.dense_only = true; break;
         case 's': o.src_dir = optarg; break;
         case 'o': o.out_path = optarg; break;
         case 't': o.threads = atoi(optarg); break;
@@ -271,8 +273,9 @@ static int cmd_convert(int argc, char **argv) {
         case 14: o.imatrix = optarg; break;
         default:
             fprintf(stderr, "usage: inz convert --src DIR --out FILE [--experts-bf16 T] [--attn T] [--dense T] [--shared T]\n"
-                            "                   [--router T] [--head T] [--embed T] [--layers N] [--imatrix FILE]\n"
-                            "types: Q4N (NVFP4 experts, exact), F16 (exact for BF16 sources), F32, Q8G, Q4L, Q3L, Q2L\n");
+                            "                   [--router T] [--head T] [--embed T] [--layers N] [--imatrix FILE] [--dense-only]\n"
+                            "types: Q4N (NVFP4 experts, exact), F16 (exact for BF16 sources), F32, Q8G, Q4L, Q3L, Q2L\n"
+                            "--dense-only: no experts (a file of dense tensors for INZ_OVERRIDE studies)\n");
             return 1;
         }
     }

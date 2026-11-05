@@ -481,7 +481,7 @@ int convert_run(const convert_opts *o) {
     declare_f32(&c, "output_norm", Q_H);
     for (int l = 0; l < NL; l++) declare_layer(&c, l);
     // experts last: they arrive last from the download and dominate the file
-    for (int l = 1; l < NL; l++) {
+    for (int l = 1; l < NL && !o->dense_only; l++) {
         const uint64_t blob = convert_expert_blob_bytes(xtype[l]);
         uint64_t ne[2] = {blob, Q_N_EXPERT};
         snprintf(name, sizeof(name), "blk.%d.experts", l);
@@ -507,7 +507,7 @@ int convert_run(const convert_opts *o) {
     // ---------------- experts ----------------
     uint8_t *layer_buf = inz_aligned(4096, convert_expert_blob_bytes(o->t_experts_bf16 > 0 ? o->t_experts_bf16 : o->t_experts) * Q_N_EXPERT +
                                                convert_expert_blob_bytes(o->t_experts) * Q_N_EXPERT);
-    for (int l = 1; l < NL; l++) {
+    for (int l = 1; l < NL && !o->dense_only; l++) {
         const uint64_t blob = convert_expert_blob_bytes(xtype[l]);
         char base[128], dbase[32];
         snprintf(base, sizeof(base), SRC "layers.%d.mlp.experts.", l);

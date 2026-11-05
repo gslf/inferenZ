@@ -1,4 +1,5 @@
 // Multi-threaded matvec bandwidth: how close each format gets to DRAM bandwidth.
+//   bench_matvec [threads] [q|all] [rows cols]   (q: Q4N and F8T only)
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -35,7 +36,7 @@ int main(int argc, char **argv) {
     for (int j = 0; j < cols; j++) x[j] = sinf(j * 0.37f);
     // Q3P appears twice: full (coarse + fine planes) and coarse-only (2-bit plane, as after a partial read)
     int types[] = {INZ_T_Q2L, INZ_T_Q3L, INZ_T_Q3P, INZ_T_Q3P, INZ_T_Q4L, INZ_T_Q8G, INZ_T_Q4N, INZ_T_F8T};
-    for (int ti = argc > 2 ? 6 : 0; ti < 8; ti++) {
+    for (int ti = argc > 2 && argv[2][0] == 'q' ? 6 : 0; ti < 8; ti++) {
         int t = types[ti];
         const bool coarse = ti == 3;
         size_t nb = inz_qmat_bytes(t, rows, cols);

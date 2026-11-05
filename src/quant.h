@@ -135,6 +135,10 @@ void inz_act_alloc(inz_act *a, int n);
 void inz_act_free(inz_act *a);
 // prepare activation for matrices with the given rotation (block 0 = none)
 void inz_act_quantize(inz_act *a, const float *x, int n, int rot_block, uint32_t rot_seed);
+// the same in slices, for several threads: inz_act_begin once, then inz_act_quantize_part on elements [i0, i1)
+// (multiples of 64 and of the rotation block) gives exactly what inz_act_quantize gives
+void inz_act_begin(inz_act *a, int n, int rot_block, uint32_t rot_seed);
+void inz_act_quantize_part(inz_act *a, const float *x, int i0, int i1);
 
 // y[r] = W[r] . x for rows [r0, r1)
 void inz_matvec_rows(const inz_qmat *m, const inz_act *a, float *y, int r0, int r1);

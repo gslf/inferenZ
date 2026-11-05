@@ -151,7 +151,8 @@ static void bind_layer(const dense_set *d, q_layer *L, int l) {
 }
 
 // Recipe studies: INZ_OVERRIDE="other.gguf:pattern1,pattern2" takes the dense tensors whose name contains a
-// pattern from another conversion of the same model (e.g. exact Mamba projections into a 4-bit recipe).
+// pattern from another conversion of the same model (e.g. `inz convert --dense-only --attn F16 ...` for exact
+// attention in the 8-bit recipe).
 static gguf_file *g_ovr;
 static char g_ovr_pat[16][32];
 static int g_n_ovr;

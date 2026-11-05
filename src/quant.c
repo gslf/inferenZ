@@ -618,19 +618,10 @@ void inz_act_free(inz_act *a) {
     memset(a, 0, sizeof(*a));
 }
 
-void inz_act_quantize(inz_act *a, const float *x, int n, int rot_block, uint32_t rot_seed) {
-    a->n = n;
-    a->ng = n / INZ_GROUP;
-    a->rot_block = rot_block;
-    a->rot_seed = rot_seed;
-    const float *src = x;
-    if (rot_block > 1) {
-        memcpy(a->xrot, x, sizeof(float) * n);
-        inz_rotate(a->xrot, n, rot_block, rot_seed);
-        src = a->xrot;
-    }
-    for (int g = 0; g < a->ng; g++) {
-        const float *xg = src + g * INZ_GROUP;
+// groups [g0, g1) of the (rotated) input src, which starts at group g0
+static void act_quantize_groups(inz_act *a, const float *src, int g0, int g1) {
+    for (int g = g0; g < g1; g++) {
+        const float *xg = src + (size_t)(g - g0) * INZ_GROUP;
         __m256 mx = _mm256_setzero_ps();
         const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
         for (int j = 0; j < INZ_GROUP; j += 8) mx = _mm256_max_ps(mx, _mm256_and_ps(_mm256_loadu_ps(xg + j), absmask));
@@ -654,6 +645,40 @@ void inz_act_quantize(inz_act *a, const float *x, int n, int rot_block, uint32_t
         a->s[g] = s;
         a->bsum[g] = s * (float)sum;
     }
+}
+
+void inz_act_begin(inz_act *a, int n, int rot_block, uint32_t rot_seed) {
+    a->n = n;
+    a->ng = n / INZ_GROUP;
+    a->rot_block = rot_block;
+    a->rot_seed = rot_seed;
+}
+
+void inz_act_quantize(inz_act *a, const float *x, int n, int rot_block, uint32_t rot_seed) {
+    inz_act_begin(a, n, rot_block, rot_seed);
+    const float *src = x;
+    if (rot_block > 1) {
+        memcpy(a->xrot, x, sizeof(float) * n);
+        inz_rotate(a->xrot, n, rot_block, rot_seed);
+        src = a->xrot;
+    }
+    act_quantize_groups(a, src, 0, a->ng);
+}
+
+void inz_act_quantize_part(inz_act *a, const float *x, int i0, int i1) {
+    const float *src = x + i0;
+    const int block = a->rot_block;
+    if (block > 1) {  // inz_rotate on [i0, i1) only: the same operations on every element
+        float *r = a->xrot + i0;
+        const float norm = 1.0f / sqrtf((float)block);
+        for (int i = i0; i < i1; i++) r[i - i0] = x[i] * rot_sign(a->rot_seed, (uint32_t)i);
+        for (int b = 0; b < i1 - i0; b += block) {
+            fwht(r + b, block);
+            for (int i = 0; i < block; i++) r[b + i] *= norm;
+        }
+        src = r;
+    }
+    act_quantize_groups(a, src, i0 / INZ_GROUP, i1 / INZ_GROUP);
 }
 
 /* ------------------------------------------------------------------ */
@@ -839,9 +864,14 @@ static void mv_q8g(const inz_qmat *m, const inz_act *a, float *y, int r0, int r1
     for (int r = r0; r < r1; r++) {
         const uint8_t *q0 = m->q + (size_t)r * ng * 64;
         const uint16_t *d0 = m->d + (size_t)r * ng;
+        const bool pf = r + 1 < r1;  // the next row, ahead of the hardware prefetcher
         __m256 acc = _mm256_setzero_ps();
         float b0 = 0;
         for (int g = 0; g < ng; g++) {
+            if (pf) {
+                _mm_prefetch((const char *)(q0 + (size_t)ng * 64 + g * 64), _MM_HINT_T0);
+                if (!(g & 31)) _mm_prefetch((const char *)(d0 + ng + g), _MM_HINT_T0);
+            }
             const __m256i x0 = _mm256_load_si256((const __m256i *)(a->q + g * 64));
             const __m256i x1 = _mm256_load_si256((const __m256i *)(a->q + g * 64 + 32));
             const __m256i u0 = _mm256_loadu_si256((const __m256i *)(q0 + g * 64));
@@ -1028,8 +1058,19 @@ static void mv_q4n(const inz_qmat *m, const inz_act *a, float *y, int r0, int r1
     for (; r + 2 <= r1; r += 2) {
         const uint8_t *q0 = m->q + (size_t)r * ng * 32, *q1 = q0 + (size_t)ng * 32;
         const uint8_t *s0 = m->s8 + (size_t)r * ng * 4, *s1 = s0 + (size_t)ng * 4;
+        // the next row pair starts a new pair of streams the hardware prefetcher has not seen yet: fetch it alongside
+        const bool pf = r + 4 <= r1;
+        const uint8_t *pq = q0 + (size_t)2 * ng * 32, *ps = s0 + (size_t)2 * ng * 4;
         __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
         for (int g = 0; g + 2 <= ng; g += 2) {
+            if (pf) {
+                _mm_prefetch((const char *)(pq + g * 32), _MM_HINT_T0);
+                _mm_prefetch((const char *)(pq + (size_t)ng * 32 + g * 32), _MM_HINT_T0);
+                if (!(g & 15)) {
+                    _mm_prefetch((const char *)(ps + g * 4), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(ps + (size_t)ng * 4 + g * 4), _MM_HINT_T0);
+                }
+            }
             const __m256 sc0 = q4n_scale8(s0 + g * 4), sc1 = q4n_scale8(s1 + g * 4);
             for (int h = 0; h < 2; h++) {
                 const int gg = g + h;
