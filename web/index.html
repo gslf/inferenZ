@@ -113,7 +113,7 @@ table.st td { border-bottom: 1px solid var(--line); padding: 5px 8px; }
       <button class="nav active" id="navchat">💬 Chat</button>
       <button class="nav" id="navmon">📈 Monitor</button>
     </div>
-    <div class="modelcard"><b id="mname">Nemotron 3.5 Super</b><span class="dot" id="mdot"></span><span id="mstat">connecting…</span></div>
+    <div class="modelcard"><b id="mname">Laguna S 2.1</b><span class="dot" id="mdot"></span><span id="mstat">connecting…</span></div>
   </aside>
   <main>
     <header><div class="title" id="title">New chat</div><div class="live" id="live"></div></header>
@@ -124,8 +124,7 @@ table.st td { border-bottom: 1px solid var(--line); padding: 5px 8px; }
         <div class="row">
           <div>
             <select id="effort" title="Reasoning effort">
-              <option value="high">Thinking: on</option><option value="medium">Thinking: efficient</option>
-              <option value="none">Thinking: off</option>
+              <option value="high">Thinking: on</option><option value="none">Thinking: off</option>
             </select>
             <select id="temp" title="Sampling">
               <option value="1.0">Temp 1.0 (default)</option><option value="0.7">Temp 0.7</option><option value="0">Greedy</option>
@@ -191,7 +190,7 @@ function msgEl(m) {
 function renderThread() {
   const t = $("thread"); t.innerHTML = "";
   $("title").textContent = cur.title || "New chat";
-  if (!cur.messages.length) { t.innerHTML = `<div class="empty"><h2>What can I help with?</h2><div>Nemotron 3.5 Super, running on this machine.</div></div>`; return; }
+  if (!cur.messages.length) { t.innerHTML = `<div class="empty"><h2>What can I help with?</h2><div>Laguna S 2.1, running on this machine.</div></div>`; return; }
   for (const m of cur.messages) t.appendChild(msgEl(m));
   $("chat").scrollTop = $("chat").scrollHeight;
 }
@@ -212,7 +211,7 @@ async function send() {
   busy = true; $("send").textContent = "Stop"; $("send").classList.add("stop");
   ctrl = new AbortController();
   const body = { model: $("mname").textContent, stream: true, stream_options: { include_usage: true }, messages: apiMessages().slice(0, -1),
-    temperature: parseFloat($("temp").value), top_p: 0.95, reasoning_effort: $("effort").value };
+    temperature: parseFloat($("temp").value), top_p: 1.0, top_k: 20, reasoning_effort: $("effort").value };
   const t0 = performance.now(); let tThinkStart = 0, ntok = 0;
   const node = () => $("thread").lastChild;
   try {
@@ -283,9 +282,9 @@ async function poll() {
   h += card("Memory", f1(m.rss_gb) + " GB RSS", `cache ${f1(m.cache_gb)} GB · dense ${f1(m.dense_gb)} GB · KV ${f2(m.kv_gb)} GB · free ${f1(m.available_gb)} GB`);
   h += card("Speculative (MTP)", g.verify_steps ? f2(g.tokens_accepted / g.verify_steps + 1) + " tok/step" : "off", `drafted ${g.tokens_drafted} · accepted ${g.tokens_accepted}`);
   h += card("Router lookahead", pct(g.lookahead.precision) + " precise", `recall ${pct(g.lookahead.recall)} of selected experts were prefetched`);
-  h += card("Recurrent state", f2(m.recurrent_state_gb) + " GB", `Mamba-2 states of 40 blocks · checkpoint at token ${d.checkpoint}`);
+  h += card("Recurrent state", f2(m.recurrent_state_gb) + " GB", `attention only: the caches are positional`);
   const rc = Object.fromEntries((d.recipe || "").split(" ").filter((x) => x.includes("=")).map((x) => x.split("=")));
-  h += card("Recipe", `${esc(rc.experts || "?")} experts`, esc(`mamba ${rc.mamba} · attention ${rc.attn} · shared ${rc.shared} · latent ${rc.latent} · head ${rc.head}`));
+  h += card("Recipe", `${esc(rc.experts || "?")} experts`, esc(`8-bit layers ${rc.experts_bf16} · attention ${rc.attn} · shared ${rc.shared} · head ${rc.head}`));
   h += card("RAM bandwidth", f1(g.peak_ram_gbs) + " GB/s", `measured at startup · ${d.threads || "?"} threads · ${esc(d.isa || "")}`);
   h += `</div>`;
   for (const ph of ["decode", "verify", "draft", "prefill"]) {

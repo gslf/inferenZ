@@ -16,7 +16,7 @@
 
 void inz_opts_default(inz_opts *o) {
     memset(o, 0, sizeof(*o));
-    o->model_path = "models/nemotron-3.5-super.inz.gguf";  // the official NVFP4/FP8 weights (README)
+    o->model_path = "models/laguna-s-2.1.inz.gguf";  // the official NVFP4 experts, 8-bit rest (README)
     o->ctx = 32768;
     o->ram_reserve_gb = 0;    // auto: max(10 GB, 30% of RAM)
     o->cache_decay = 0.01f;
@@ -124,34 +124,27 @@ static void dlin(const dense_set *d, lin *m, const char *fmt, int l, int rows, i
     if (d->e->imx_path) m->imx = q_imx_register(d->e, t->name, cols);
 }
 
-// one block: "blk.N" or "mtp.at" / "mtp.moe"
-static void bind_block(const dense_set *d, q_layer *L, const char *pfx, int kind, int idx) {
+// one decoder layer "blk.N": attention, then the dense MLP (layer 0) or the MoE (the experts are bound by setup_experts)
+static void bind_layer(const dense_set *d, q_layer *L, int l) {
     char f[64];
-#define N(suffix) (snprintf(f, sizeof(f), "%s." suffix, pfx), f)
-    L->kind = kind;
-    L->idx = idx;
-    L->norm = dvec(d, N("norm"), 0, Q_H);
-    if (kind == QB_MAMBA) {
-        dlin(d, &L->mb_in, N("mb.in"), 0, Q_MB_PROJ, Q_H);
-        dlin(d, &L->mb_out, N("mb.out"), 0, Q_H, Q_MB_INNER);
-        L->mb_conv = dvec(d, N("mb.conv"), 0, (uint64_t)Q_MB_CONV * Q_MB_KS);
-        L->mb_conv_b = dvec(d, N("mb.conv_bias"), 0, Q_MB_CONV);
-        const float *A_log = dvec(d, N("mb.A_log"), 0, Q_MB_NH);
-        for (int h = 0; h < Q_MB_NH; h++) L->mb_negA[h] = -expf(A_log[h]);
-        L->mb_D = dvec(d, N("mb.D"), 0, Q_MB_NH);
-        L->mb_dt = dvec(d, N("mb.dt_bias"), 0, Q_MB_NH);
-        L->mb_norm = dvec(d, N("mb.norm"), 0, Q_MB_INNER);
-    } else if (kind == QB_ATTN) {
-        dlin(d, &L->at_q, N("at.q"), 0, Q_QD, Q_H);
-        dlin(d, &L->at_k, N("at.k"), 0, Q_KV, Q_H);
-        dlin(d, &L->at_v, N("at.v"), 0, Q_KV, Q_H);
-        dlin(d, &L->at_o, N("at.o"), 0, Q_H, Q_QD);
+#define N(suffix) (snprintf(f, sizeof(f), "blk.%d." suffix, l), f)
+    L->nh = q_nh(l);
+    L->attn_norm = dvec(d, N("attn_norm"), 0, Q_H);
+    L->mlp_norm = dvec(d, N("mlp_norm"), 0, Q_H);
+    dlin(d, &L->at_q, N("at.q"), 0, L->nh * Q_HD, Q_H);
+    dlin(d, &L->at_k, N("at.k"), 0, Q_KV, Q_H);
+    dlin(d, &L->at_v, N("at.v"), 0, Q_KV, Q_H);
+    dlin(d, &L->at_o, N("at.o"), 0, Q_H, L->nh * Q_HD);
+    dlin(d, &L->at_g, N("at.g"), 0, L->nh, Q_H);
+    L->q_norm = dvec(d, N("at.q_norm"), 0, Q_HD);
+    L->k_norm = dvec(d, N("at.k_norm"), 0, Q_HD);
+    if (l == 0) {
+        dlin(d, &L->d_gu, N("mlp.gate_up"), 0, 2 * Q_DENSE_FF, Q_H);
+        dlin(d, &L->d_down, N("mlp.down"), 0, Q_H, Q_DENSE_FF);
     } else {
         dlin(d, &L->router, N("router"), 0, Q_N_EXPERT, Q_H);
         L->router_bias = dvec(d, N("router_bias"), 0, Q_N_EXPERT);
-        dlin(d, &L->lat_in, N("lat_in"), 0, Q_LAT, Q_H);
-        dlin(d, &L->lat_out, N("lat_out"), 0, Q_H, Q_LAT);
-        dlin(d, &L->sh_up, N("sh.up"), 0, Q_SHARED_FF, Q_H);
+        dlin(d, &L->sh_gu, N("sh.gate_up"), 0, 2 * Q_SHARED_FF, Q_H);
         dlin(d, &L->sh_down, N("sh.down"), 0, Q_H, Q_SHARED_FF);
     }
 #undef N
@@ -228,27 +221,11 @@ static void load_dense(inz_engine *e) {
     if (e->opt.mlock && mlock(e->dense_mem, total) != 0) LOGI("mlock of dense weights failed (RLIMIT_MEMLOCK); continuing");
     LOGI("dense weights: %.2f GiB loaded in %.1f s", total / 1073741824.0, inz_now() - t0);
 
-    int count[256] = {0};
-    for (int l = 0; l < e->n_layer; l++) {
-        char pfx[16];
-        snprintf(pfx, sizeof(pfx), "blk.%d", l);
-        const int kind = q_kind(l);
-        bind_block(&d, &e->L[l], pfx, kind, count[kind]++);
-    }
-    e->n_moe = count[QB_MOE];
+    for (int l = 0; l < e->n_layer; l++) bind_layer(&d, &e->L[l], l);
+    e->n_moe = e->n_layer - 1;
     e->norm_f = dvec(&d, "output_norm", 0, Q_H);
     dlin(&d, &e->head, "output.weight", 0, Q_VOCAB, Q_H);
-    q_mtp *M = &e->mtp;
-    M->present = gguf_find_tensor(g, "mtp.eh") != NULL;
-    if (M->present) {
-        dlin(&d, &M->eh, "mtp.eh", 0, Q_H, 2 * Q_H);
-        M->enorm = dvec(&d, "mtp.enorm", 0, Q_H);
-        M->hnorm = dvec(&d, "mtp.hnorm", 0, Q_H);
-        M->final_norm = dvec(&d, "mtp.final_norm", 0, Q_H);
-        bind_block(&d, &M->at, "mtp.at", QB_ATTN, Q_N_ATTN);
-        bind_block(&d, &M->moe, "mtp.moe", QB_MOE, e->n_moe);
-        LOGI("MTP layer loaded: speculative decoding available");
-    }
+    e->mtp.present = false;
     free(d.items);
 }
 
@@ -271,25 +248,40 @@ static void setup_embed(inz_engine *e) {
         inz_die("model: token_embd.weight must be F16 or an unrotated %dx%d matrix with one scale per group", Q_VOCAB, Q_H);
 }
 
+// The MoE layers form blob classes by expert storage type (the official NVFP4 layers as Q4N; the layers the checkpoint
+// keeps in BF16 as an 8-bit format). Each class has its own cache of fixed-size slots; the memory budget is split in
+// proportion to the classes' sizes, so both keep the same fraction of their experts.
 static void setup_experts(inz_engine *e, uint64_t other_bytes) {
     gguf_file *g = e->g;
-    e->expert_type = (int)gguf_get_int(g, "inz.expert_type", INZ_T_Q4N);
-    e->blob_bytes = (uint64_t)gguf_get_int(g, "inz.expert_blob_bytes", 0);
-    e->up_bytes = inz_mat_bytes(e->expert_type, Q_FF, Q_LAT);
-    if (e->up_bytes + inz_mat_bytes(e->expert_type, Q_LAT, Q_FF) > e->blob_bytes || e->blob_bytes % 4096)
-        inz_die("model: expert blob size %llu does not fit type %s", (unsigned long long)e->blob_bytes, inz_qtype_name(e->expert_type));
-    const int nl = e->n_moe + (e->mtp.present ? 1 : 0);  // the MTP layer's experts are layer n_moe
-    if (!nl) return;                                     // a truncated test model without MoE blocks
-    uint64_t *off = inz_malloc(sizeof(uint64_t) * (size_t)nl * Q_N_EXPERT);
-    for (int l = 0; l < nl; l++) {
+    if (e->n_moe <= 0) return;  // a truncated test model without MoE layers
+    const gguf_kv *kt = gguf_find_kv(g, "inz.expert_types");
+    if (!kt || kt->arr_n < (uint64_t)e->n_layer) inz_die("model: inz.expert_types missing");
+    const int32_t *types = (const int32_t *)kt->data;
+    int nl[2] = {0, 0};
+    for (int l = 1; l < e->n_layer; l++) {
+        int c = 0;
+        while (c < e->n_xc && e->xc[c].type != types[l]) c++;
+        if (c == e->n_xc) {
+            if (e->n_xc == 2) inz_die("model: more than two expert types");
+            e->xc[c].type = types[l];
+            e->n_xc++;
+        }
         char name[64];
-        if (l < e->n_moe) snprintf(name, sizeof(name), "moe.%d.experts", l);
-        else snprintf(name, sizeof(name), "mtp.experts");
+        snprintf(name, sizeof(name), "blk.%d.experts", l);
         const gguf_tensor *t = gguf_find_tensor(g, name);
-        if (!t || t->nbytes < e->blob_bytes * Q_N_EXPERT) inz_die("model: missing or short %s", name);
-        for (int x = 0; x < Q_N_EXPERT; x++) off[(size_t)l * Q_N_EXPERT + x] = g->data_offset + t->offset + (uint64_t)x * e->blob_bytes;
+        if (!t) inz_die("model: missing %s", name);
+        q_xclass *x = &e->xc[c];
+        if (!x->blob_bytes) {
+            x->blob_bytes = t->ne[0];
+            x->gu_bytes = inz_mat_bytes(x->type, 2 * Q_FF, Q_H);
+            if (x->gu_bytes + inz_mat_bytes(x->type, Q_H, Q_FF) > x->blob_bytes || x->blob_bytes % 4096)
+                inz_die("model: expert blob size %llu does not fit type %s", (unsigned long long)x->blob_bytes, inz_qtype_name(x->type));
+        } else if (t->ne[0] != x->blob_bytes) inz_die("model: %s has another blob size", name);
+        e->L[l].xc = x;
+        e->L[l].xl = nl[c]++;
     }
-    const uint64_t total = (uint64_t)nl * Q_N_EXPERT * e->blob_bytes;
+    uint64_t total[2] = {0, 0}, all_total = 0;
+    for (int c = 0; c < e->n_xc; c++) all_total += total[c] = (uint64_t)nl[c] * Q_N_EXPERT * e->xc[c].blob_bytes;
     uint64_t budget = e->opt.cache_bytes;
     if (!budget) {
         // The engine's whole footprint stays within MemTotal - reserve. The reserve keeps the desktop and the page
@@ -306,35 +298,51 @@ static void setup_experts(inz_engine *e, uint64_t other_bytes) {
         const uint64_t now = avail > other_bytes + (2ull << 30) ? avail - other_bytes - (2ull << 30) : 0;
         budget = cap < now ? cap : now;
     }
-    const bool all = budget >= total;
-    e->ec_all_resident = all;
-    ec_config cfg = {.path = g->path, .n_layer = nl, .n_expert = Q_N_EXPERT, .offset = off, .blob_bytes = e->blob_bytes,
-                     .cache_bytes = all ? total : budget, .queue_depth = 64, .sqpoll_cpu = e->opt.sqpoll_cpu,
-                     .decay = e->opt.cache_decay, .all_resident = all};
-    char err[256];
-    e->ec = ec_open(&cfg, err, sizeof(err));
-    free(off);
-    if (!e->ec) inz_die("expert cache: %s", err);
-    LOGI("experts: %s, %.2f MiB each, %d layers x %d = %.1f GiB on SSD, cache %.1f GiB (%.0f%%)", inz_qtype_name(e->expert_type),
-         e->blob_bytes / 1048576.0, nl, Q_N_EXPERT, total / 1073741824.0, ec_slot_count(e->ec) * (double)e->blob_bytes / 1073741824.0,
-         100.0 * ec_slot_count(e->ec) / (double)(nl * Q_N_EXPERT));
-    if (!all) {
-        g_diag.peak_ssd_gbs = ec_probe_bandwidth(e->ec, 24);
-        LOGI("SSD expert-read bandwidth probe: %.2f GB/s", g_diag.peak_ssd_gbs);
-        if (e->opt.hotlist) {
-            const double t0 = inz_now();
-            const int n = ec_load_and_preload(e->ec, e->opt.hotlist);
-            if (n) LOGI("warm start: preloaded %d experts from %s in %.1f s", n, e->opt.hotlist, inz_now() - t0);
+    for (int c = 0; c < e->n_xc; c++) {
+        q_xclass *x = &e->xc[c];
+        uint64_t *off = inz_malloc(sizeof(uint64_t) * (size_t)nl[c] * Q_N_EXPERT);
+        for (int l = 1; l < e->n_layer; l++) {
+            if (e->L[l].xc != x) continue;
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%d.experts", l);
+            const gguf_tensor *t = gguf_find_tensor(g, name);
+            for (int k = 0; k < Q_N_EXPERT; k++)
+                off[(size_t)e->L[l].xl * Q_N_EXPERT + k] = g->data_offset + t->offset + (uint64_t)k * x->blob_bytes;
         }
-    } else {
-        int32_t *pairs = inz_malloc(sizeof(int32_t) * 2 * (size_t)nl * Q_N_EXPERT);
-        int k = 0;
-        for (int l = 0; l < nl; l++)
-            for (int x = 0; x < Q_N_EXPERT; x++) { pairs[2 * k] = l; pairs[2 * k + 1] = x; k++; }
-        const double t0 = inz_now();
-        ec_preload(e->ec, pairs, k);
-        LOGI("all experts resident (%.1f s)", inz_now() - t0);
-        free(pairs);
+        const uint64_t share = budget >= all_total ? total[c] : (uint64_t)((double)budget * total[c] / all_total);
+        x->all_resident = share >= total[c];
+        ec_config cfg = {.path = g->path, .n_layer = nl[c], .n_expert = Q_N_EXPERT, .offset = off, .blob_bytes = x->blob_bytes,
+                         .cache_bytes = share, .queue_depth = 64, .sqpoll_cpu = c ? -1 : e->opt.sqpoll_cpu,
+                         .decay = e->opt.cache_decay, .all_resident = x->all_resident};
+        char err[256];
+        x->ec = ec_open(&cfg, err, sizeof(err));
+        free(off);
+        if (!x->ec) inz_die("expert cache: %s", err);
+        LOGI("experts %d: %s, %.2f MiB each, %d layers x %d = %.1f GiB on SSD, cache %.1f GiB (%.0f%%)", c, inz_qtype_name(x->type),
+             x->blob_bytes / 1048576.0, nl[c], Q_N_EXPERT, total[c] / 1073741824.0,
+             ec_slot_count(x->ec) * (double)x->blob_bytes / 1073741824.0, 100.0 * ec_slot_count(x->ec) / (double)(nl[c] * Q_N_EXPERT));
+        if (!x->all_resident) {
+            if (c == 0) {
+                g_diag.peak_ssd_gbs = ec_probe_bandwidth(x->ec, 24);
+                LOGI("SSD expert-read bandwidth probe: %.2f GB/s", g_diag.peak_ssd_gbs);
+            }
+            if (e->opt.hotlist) {
+                char hp[1100];
+                snprintf(hp, sizeof(hp), "%s.%d", e->opt.hotlist, c);
+                const double t0 = inz_now();
+                const int n = ec_load_and_preload(x->ec, hp);
+                if (n) LOGI("warm start: preloaded %d experts from %s in %.1f s", n, hp, inz_now() - t0);
+            }
+        } else {
+            int32_t *pairs = inz_malloc(sizeof(int32_t) * 2 * (size_t)nl[c] * Q_N_EXPERT);
+            int k = 0;
+            for (int l = 0; l < nl[c]; l++)
+                for (int xx = 0; xx < Q_N_EXPERT; xx++) { pairs[2 * k] = l; pairs[2 * k + 1] = xx; k++; }
+            const double t0 = inz_now();
+            ec_preload(x->ec, pairs, k);
+            LOGI("all experts %d resident (%.1f s)", c, inz_now() - t0);
+            free(pairs);
+        }
     }
 }
 
@@ -342,71 +350,42 @@ static void setup_experts(inz_engine *e, uint64_t other_bytes) {
 /* Sequence state                                                      */
 /* ------------------------------------------------------------------ */
 
-static const size_t S_FLOATS = (size_t)Q_N_MAMBA * Q_MB_NH * Q_MB_HD * Q_MB_DS;
-static const size_t CONV_FLOATS = (size_t)Q_N_MAMBA * (Q_MB_KS - 1) * Q_MB_CONV;
-#define N_ATT (Q_N_ATTN + 1)  // the model's attention blocks + the MTP layer
-
-static void rec_alloc(q_state *q) {
-    q->S = inz_mmap_anon(S_FLOATS * 4, true);
-    q->conv = inz_mmap_anon(CONV_FLOATS * 4, false);
-}
-
-static void rec_free(q_state *q) {
-    inz_munmap(q->S, S_FLOATS * 4);
-    inz_munmap(q->conv, CONV_FLOATS * 4);
-}
-
-static void rec_copy(q_state *dst, const q_state *src) {
-    memcpy(dst->S, src->S, S_FLOATS * 4);
-    memcpy(dst->conv, src->conv, CONV_FLOATS * 4);
-}
+#define N_SWA (Q_N_LAYER - Q_N_FULL)
 
 static void state_alloc(inz_engine *e) {
     q_state *st = &e->st;
     const size_t ctx = (size_t)e->ctx;
-    rec_alloc(st);
-    // pages are touched lazily: an unused context or MTP layer costs no memory
-    st->k = inz_mmap_anon((size_t)N_ATT * ctx * Q_KV * 2, true);
-    st->v = inz_mmap_anon((size_t)N_ATT * ctx * Q_KV * 2, true);
-    rec_alloc(&e->ck);
-    for (int i = 0; i < Q_SPEC_MAX; i++) rec_alloc(&e->snap[i]);
+    // pages are touched lazily: an unused context costs no memory
+    st->kf = inz_mmap_anon((size_t)Q_N_FULL * ctx * Q_KV * 2, true);
+    st->vf = inz_mmap_anon((size_t)Q_N_FULL * ctx * Q_KV * 2, true);
+    st->ks = inz_mmap_anon((size_t)N_SWA * Q_RING * Q_KV * 2, true);
+    st->vs = inz_mmap_anon((size_t)N_SWA * Q_RING * Q_KV * 2, true);
     e->ck_x = inz_aligned(64, sizeof(float) * Q_H);
     e->x_last = inz_aligned(64, sizeof(float) * Q_H);
-    e->Xm = inz_aligned(64, sizeof(float) * (size_t)Q_MAX_T * Q_H);
+    e->Xm = inz_aligned(64, sizeof(float) * Q_H);
     e->ck_pos = -1;
     e->hist = inz_malloc(sizeof(int32_t) * ctx);
-    e->state_bytes = (2 + Q_SPEC_MAX) * (S_FLOATS + CONV_FLOATS) * 4 + (size_t)N_ATT * ctx * 2 * Q_KV * 2;
+    e->state_bytes = ((size_t)Q_N_FULL * ctx + (size_t)N_SWA * Q_RING) * Q_KV * 2 * 2;
 }
 
 static void state_free(inz_engine *e) {
     q_state *st = &e->st;
     const size_t ctx = (size_t)e->ctx;
-    rec_free(st);
-    inz_munmap(st->k, (size_t)N_ATT * ctx * Q_KV * 2);
-    inz_munmap(st->v, (size_t)N_ATT * ctx * Q_KV * 2);
-    rec_free(&e->ck);
-    for (int i = 0; i < Q_SPEC_MAX; i++) rec_free(&e->snap[i]);
+    inz_munmap(st->kf, (size_t)Q_N_FULL * ctx * Q_KV * 2);
+    inz_munmap(st->vf, (size_t)Q_N_FULL * ctx * Q_KV * 2);
+    inz_munmap(st->ks, (size_t)N_SWA * Q_RING * Q_KV * 2);
+    inz_munmap(st->vs, (size_t)N_SWA * Q_RING * Q_KV * 2);
     free(e->ck_x);
     free(e->x_last);
     free(e->Xm);
     free(e->hist);
 }
 
-// The attention caches are positional (entries below a position stay valid when the sequence is rewound there);
-// the recurrent state is not, so it is saved before the last prompt token and restored to rewind.
-static void checkpoint_save(inz_engine *e) {
-    rec_copy(&e->ck, &e->st);
-    memcpy(e->ck_x, e->x_last, sizeof(float) * Q_H);
-    e->ck_pos = e->n_past;
-}
+// Every cache is positional, so the sequence can be rewound to any position p whose sliding window the rings still
+// hold: the positions written after p must not have wrapped onto (p - window, p].
+static bool can_rewind(const inz_engine *e, int p) { return p >= 0 && p <= e->n_past && e->n_past - p <= Q_RING - Q_WINDOW; }
 
-static void checkpoint_restore(inz_engine *e) {
-    rec_copy(&e->st, &e->ck);
-    memcpy(e->x_last, e->ck_x, sizeof(float) * Q_H);
-    e->n_past = e->ck_pos;
-    // MTP slot p needs the token at p + 1: slots from ck_pos - 1 on are recomputed
-    if (e->mtp_valid > e->ck_pos - 1) e->mtp_valid = e->ck_pos > 0 ? e->ck_pos - 1 : 0;
-}
+static void checkpoint_save(inz_engine *e) { e->ck_pos = e->n_past; }
 
 /* ------------------------------------------------------------------ */
 /* Open / close                                                        */
@@ -435,7 +414,7 @@ inz_engine *engine_open(const inz_opts *o, char *err, size_t errlen) {
     e->opt.hotlist = hotlist_path(o->hotlist, o->model_path, e->g->size);
     e->imx_path = getenv("INZ_IMATRIX");
     if (e->imx_path && !*e->imx_path) e->imx_path = NULL;
-    snprintf(e->model_name, sizeof(e->model_name), "nemotron-3.5-super");
+    snprintf(e->model_name, sizeof(e->model_name), "laguna-s-2.1");
     e->chat_template = gguf_get_str(e->g, "tokenizer.chat_template", NULL);
     if (build_tokenizer(e) != 0) { snprintf(err, errlen, "tokenizer metadata missing"); gguf_close(e->g); free(e); return NULL; }
     // threads: P + E cores by default (LP-E cores serve I/O and HTTP)
@@ -452,7 +431,7 @@ inz_engine *engine_open(const inz_opts *o, char *err, size_t errlen) {
         for (int i = topo.n_cpu - 1; i >= 0; i--) if (topo.cpu_class[i] == 2) { e->opt.sqpoll_cpu = topo.cpu_id[i]; break; }
     }
     diag_probe_ram(e->tp);
-    diag_init(Q_N_LAYER + 2, Q_N_MOE + 1, Q_N_EXPERT, Q_TOPK);  // + the MTP blocks; routing per MoE block
+    diag_init(Q_N_LAYER, Q_N_MOE, Q_N_EXPERT, Q_TOPK);  // routing per MoE layer
     if (o->route_trace) g_diag.route_trace = fopen(o->route_trace, "w");
     LOGI("RAM bandwidth probe: %.1f GB/s", g_diag.peak_ram_gbs);
     load_dense(e);
@@ -460,15 +439,16 @@ inz_engine *engine_open(const inz_opts *o, char *err, size_t errlen) {
     e->ctx = o->ctx > 0 ? o->ctx : 32768;
     state_alloc(e);
     q_scratch_alloc(e);
+    q_rope_init(e);
     q_state_reset(e);
     if (e->imx_path) {
-        const size_t nl = (size_t)e->n_moe + (e->mtp.present ? 1 : 0);
-        e->imx_exp = inz_calloc(nl * Q_N_EXPERT * (Q_LAT + Q_FF), sizeof(double));
+        const size_t nl = (size_t)(e->n_moe > 0 ? e->n_moe : 0);
+        e->imx_exp = inz_calloc(nl * Q_N_EXPERT * (Q_H + Q_FF), sizeof(double));
         e->imx_exp_n = inz_calloc(nl * Q_N_EXPERT, sizeof(uint64_t));
         LOGI("imatrix: collecting input statistics into %s", e->imx_path);
     }
     // state pages are touched lazily; budget the full context so the cache never starves long chats
-    setup_experts(e, e->state_bytes + (2ull << 30) + (e->imx_path ? (uint64_t)(Q_N_MOE + 1) * Q_N_EXPERT * (Q_LAT + Q_FF) * 8 : 0));
+    setup_experts(e, e->state_bytes + (2ull << 30) + (e->imx_path ? (uint64_t)Q_N_MOE * Q_N_EXPERT * (Q_H + Q_FF) * 8 : 0));
     e->t_loaded = inz_now();
     e->state = "idle";
     return e;
@@ -477,8 +457,12 @@ inz_engine *engine_open(const inz_opts *o, char *err, size_t errlen) {
 void engine_close(inz_engine *e) {
     if (!e) return;
     if (e->imx_path) q_imx_write(e);
-    if (e->ec && e->opt.hotlist && ec_save_scores(e->ec, e->opt.hotlist)) LOGI("expert scores saved to %s", e->opt.hotlist);
-    ec_close(e->ec);
+    for (int c = 0; c < e->n_xc; c++) {
+        char hp[1100];
+        if (e->opt.hotlist) snprintf(hp, sizeof(hp), "%s.%d", e->opt.hotlist, c);
+        if (e->xc[c].ec && e->opt.hotlist && ec_save_scores(e->xc[c].ec, hp)) LOGI("expert scores saved to %s", hp);
+        ec_close(e->xc[c].ec);
+    }
     q_scratch_free(e);
     state_free(e);
     inz_munmap(e->dense_mem, e->dense_bytes);
@@ -580,11 +564,12 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
     g_diag.requests++;
     diag_request_start();
     // reuse the longest common prefix: continue the current state when it is a prefix of the prompt, else rewind
-    // to the checkpoint when that lies inside the common part, else start over
+    // to the end of the common part (the caches are positional), else start over
     int keep = 0;
     while (keep < e->n_past && keep < n_prompt && e->hist[keep] == prompt[keep]) keep++;
     if (!(keep == e->n_past && keep < n_prompt)) {
-        if (e->ck_pos >= 0 && e->ck_pos <= keep && e->ck_pos < n_prompt) checkpoint_restore(e);
+        const int target = keep < n_prompt ? keep : n_prompt - 1;
+        if (can_rewind(e, target)) e->n_past = target;
         else q_state_reset(e);
     }
     if (use_mtp(e) && e->n_past > 0 && e->mtp_valid != e->n_past - 1) q_state_reset(e);  // regain the MTP cache
@@ -709,8 +694,7 @@ int engine_generate(inz_engine *e, const int32_t *prompt, int n_prompt, const ge
             if (!cb(ud, vt[i])) { res->finish_reason = "stop"; keep_i = i; stop = true; break; }
             if (res->gen_tokens >= g->max_tokens) { res->finish_reason = "length"; keep_i = i; stop = true; break; }
         }
-        if (keep_i < k) {                       // rewind the recurrent state to just after vt[keep_i]
-            rec_copy(&e->st, &e->snap[keep_i]);
+        if (keep_i < k) {                       // rewind to just after vt[keep_i] (positional caches)
             e->n_past = P + keep_i + 1;
             memcpy(e->x_last, e->X + (size_t)keep_i * Q_H, sizeof(float) * Q_H);
         }
@@ -762,9 +746,9 @@ float *engine_eval_logits_ex(inz_engine *e, const int32_t *tokens, int n, int la
     return out;
 }
 
-// Validation of the speculative rewind: positions [n - last, n) are decoded in verify passes of three tokens
-// (two real ones and a junk draft) with snapshots, then rewound as a rejected draft would be, alternately to
-// after the first and after the second token. The logits must equal a plain evaluation's.
+// Validation of rewinds: positions [n - last, n) are decoded in passes of three tokens (two real ones and a junk
+// draft), then rewound as a rejected draft would be, alternately to after the first and after the second token. The
+// logits must equal a plain evaluation's.
 float *engine_eval_snapshots(inz_engine *e, const int32_t *tokens, int n, int last) {
     if (last <= 0 || last > n) last = n;
     const int from = n - last;
@@ -778,12 +762,9 @@ float *engine_eval_snapshots(inz_engine *e, const int32_t *tokens, int n, int la
     for (int p = from, step = 0; p < n; step++) {
         const bool two = (step & 1) && p + 1 < n;  // keep two real tokens (snapshot 1) or one (snapshot 0)
         const int32_t vt[3] = {tokens[p], p + 1 < n ? tokens[p + 1] : 0, 1234};
-        e->snap_n = 2;
         q_forward(e, vt, 3, rows, 3, lg);
-        e->snap_n = 0;
         const int keep = two ? 1 : 0;
         for (int i = 0; i <= keep; i++) memcpy(out + (size_t)(p - from + i) * Q_VOCAB, lg + (size_t)i * Q_VOCAB, sizeof(float) * Q_VOCAB);
-        rec_copy(&e->st, &e->snap[keep]);
         e->n_past = p + keep + 1;
         memcpy(e->x_last, e->X + (size_t)keep * Q_H, sizeof(float) * Q_H);
         p += keep + 1;
@@ -829,36 +810,45 @@ void engine_diag_json(inz_engine *e, jw *w) {
     jw_kint(w, "checkpoint", e->ck_pos);
     jw_key(w, "diag");
     diag_write_json(w);
-    if (e->ec) {
-        const ec_stats *st = ec_get_stats(e->ec);
+    if (e->n_xc) {
+        // both expert classes together
+        uint64_t slots = 0, resident = 0, lookups = 0, hits = 0, misses = 0, bytes = 0, reads = 0, evictions = 0, hist[16] = {0};
+        double lat = 0, stall = 0;
+        for (int c = 0; c < e->n_xc; c++) {
+            const ec_stats *st = ec_get_stats(e->xc[c].ec);
+            slots += st->slots; resident += st->resident; lookups += st->lookups; hits += st->hits; misses += st->misses;
+            bytes += st->bytes_read; reads += st->reads; evictions += st->evictions; lat += st->read_lat_sum_s; stall += st->stall_s;
+            for (int i = 0; i < 16; i++) hist[i] += st->lat_hist[i];
+        }
         static uint64_t prev_lookups, prev_hits;
         static double prev_t;
         const double now = inz_now();
-        const double recent = st->lookups > prev_lookups ? (double)(st->hits - prev_hits) / (double)(st->lookups - prev_lookups)
-                                                         : (st->lookups ? (double)st->hits / st->lookups : 0);
-        if (now - prev_t > 2.0) { prev_lookups = st->lookups; prev_hits = st->hits; prev_t = now; }
+        const double recent = lookups > prev_lookups ? (double)(hits - prev_hits) / (double)(lookups - prev_lookups)
+                                                     : (lookups ? (double)hits / lookups : 0);
+        if (now - prev_t > 2.0) { prev_lookups = lookups; prev_hits = hits; prev_t = now; }
         jw_key(w, "cache");
         jw_obj(w);
-        jw_kint(w, "slots", (int64_t)st->slots);
-        jw_kint(w, "resident", (int64_t)st->resident);
-        jw_kint(w, "lookups", (int64_t)st->lookups);
-        jw_kint(w, "hits", (int64_t)st->hits);
-        jw_kint(w, "misses", (int64_t)st->misses);
-        jw_knum(w, "hit_rate", st->lookups ? (double)st->hits / st->lookups : 0);
+        jw_kint(w, "slots", (int64_t)slots);
+        jw_kint(w, "resident", (int64_t)resident);
+        jw_kint(w, "lookups", (int64_t)lookups);
+        jw_kint(w, "hits", (int64_t)hits);
+        jw_kint(w, "misses", (int64_t)misses);
+        jw_knum(w, "hit_rate", lookups ? (double)hits / lookups : 0);
         jw_knum(w, "hit_rate_recent", recent);
-        jw_kint(w, "bytes_read", (int64_t)st->bytes_read);
-        jw_kint(w, "reads", (int64_t)st->reads);
-        jw_knum(w, "read_lat_avg_us", st->reads ? st->read_lat_sum_s / st->reads * 1e6 : 0);
-        jw_knum(w, "stall_s", st->stall_s);
-        jw_kint(w, "evictions", (int64_t)st->evictions);
+        jw_kint(w, "bytes_read", (int64_t)bytes);
+        jw_kint(w, "reads", (int64_t)reads);
+        jw_knum(w, "read_lat_avg_us", reads ? lat / reads * 1e6 : 0);
+        jw_knum(w, "stall_s", stall);
+        jw_kint(w, "evictions", (int64_t)evictions);
         jw_key(w, "latency_hist_us_log2");
         jw_arr(w);
-        for (int i = 0; i < 16; i++) jw_int(w, (int64_t)st->lat_hist[i]);
+        for (int i = 0; i < 16; i++) jw_int(w, (int64_t)hist[i]);
         jw_arr_end(w);
         jw_key(w, "layer_hit_rate");
         jw_arr(w);
-        for (int l = 0; l < e->n_moe; l++) {
-            const uint64_t h = st->layer_hits[l], m = st->layer_misses[l];
+        for (int l = 1; l < e->n_layer; l++) {
+            const ec_stats *st = ec_get_stats(e->L[l].xc->ec);
+            const uint64_t h = st->layer_hits[e->L[l].xl], m = st->layer_misses[e->L[l].xl];
             jw_num(w, h + m ? (double)h / (h + m) : 0);
         }
         jw_arr_end(w);
@@ -869,9 +859,12 @@ void engine_diag_json(inz_engine *e, jw *w) {
     jw_knum(w, "rss_gb", inz_rss() / 1e9);
     jw_knum(w, "available_gb", inz_mem_available() / 1e9);
     jw_knum(w, "dense_gb", e->dense_bytes / 1e9);
-    jw_knum(w, "cache_gb", e->ec ? ec_slot_count(e->ec) * (double)e->blob_bytes / 1e9 : 0);
-    jw_knum(w, "recurrent_state_gb", (double)(S_FLOATS + CONV_FLOATS) * 4 / 1e9);
-    jw_knum(w, "kv_gb", (double)e->n_past * Q_N_ATTN * 2.0 * Q_KV * 2 / 1e9);
+    double cache_gb = 0;
+    for (int c = 0; c < e->n_xc; c++) cache_gb += ec_slot_count(e->xc[c].ec) * (double)e->xc[c].blob_bytes / 1e9;
+    jw_knum(w, "cache_gb", cache_gb);
+    jw_knum(w, "recurrent_state_gb", 0);
+    const int swa = e->n_past < Q_RING ? e->n_past : Q_RING;
+    jw_knum(w, "kv_gb", ((double)e->n_past * Q_N_FULL + (double)swa * N_SWA) * 2.0 * Q_KV * 2 / 1e9);
     jw_obj_end(w);
     const tp_stats *ts = tp_get_stats(e->tp);
     jw_key(w, "thread_busy_s");

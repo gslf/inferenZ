@@ -7,15 +7,14 @@
 typedef struct {
     const char *src_dir;
     const char *out_path;
-    // storage types (INZ_T_*). The defaults copy the official checkpoint exactly: F8T for its FP8 tensors, Q4N for
-    // its NVFP4 tensors, F16 for its BF16 matrices (BF16 has 7 mantissa bits, F16 has 10).
-    int t_mamba;       // Mamba-2 in/out projections (FP8)
-    int t_attn;        // attention projections (FP8)
-    int t_shared;      // shared expert (NVFP4)
-    int t_latent;      // LatentMoE projections (BF16)
-    int t_router;      // MoE router (BF16)
-    int t_mtp;         // MTP input projection and attention (BF16)
-    int t_experts;     // routed experts (NVFP4)
+    // storage types (INZ_T_*). NVFP4 experts are always repacked exactly as Q4N; the checkpoint's BF16 tensors get the
+    // recipe's formats (F16 keeps them practically exact: BF16 has 7 mantissa bits, F16 has 10).
+    int t_experts;        // NVFP4 routed experts (Q4N)
+    int t_experts_bf16;   // routed experts the checkpoint keeps in BF16 (layers 40-47)
+    int t_attn;           // attention projections
+    int t_dense;          // layer 0 MLP
+    int t_shared;         // shared experts
+    int t_router;         // MoE router
     int t_head, t_embed;
     int max_layers;    // truncate (for tests)
     const char *imatrix;  // importance matrix (INZ_IMATRIX=file inz dump ...): weights the quantization error

@@ -1,4 +1,4 @@
-# Compare logits: reference (.npy from tests/ref_nemotron.py, or raw float32 [n][vocab] from inz dump) against
+# Compare logits: reference (.npy from tests/ref_laguna.py, or raw float32 [n][vocab] from inz dump) against
 # engine logits (raw float32). Prints cosine, KL(ref || engine), top-1 and top-5 agreement.
 #
 #   python3 tests/compare_logits.py REF.npy|REF.f32 ENGINE.f32
@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 
-V = 131072
+V = 100352
 
 
 def load(path):

@@ -1,65 +1,54 @@
-# Nemotron 3.5 Super
+# Laguna S 2.1
 
 [README](../README.md)
 
-NVIDIA Nemotron 3.5 Super has 120 billion parameters, but each token uses only about 12 billion of them. Most of the weights are *experts* that are consulted only when they are relevant. That is what lets a model this large run on a laptop: for each token, the engine only needs the small part of the model that the token uses.
+Poolside's Laguna S 2.1 has 118 billion parameters, but each token uses only about 8.5 billion of them. Most of the weights are *experts* that are consulted only when they are relevant. That is what lets a model this large run on a laptop: for each token, the engine only needs the small part of the model that the token uses. Laguna is trained for coding and agentic work.
 
-inferenZ runs the language model of the official release, *Nemotron-3.5-Super-VL-120B-A12B*. The vision encoder of that release is not converted.
+A token goes through 48 layers. Each layer does two things:
+1. it looks at the earlier tokens, to bring in context (*attention*);
+2. it transforms what it has gathered, with a few experts chosen for this token (layer 0 uses one large network instead).
 
-A token goes through 88 blocks. Every block reads the running state of the token (the *residual stream*), normalizes it, computes something and adds the result back. There are three kinds of blocks:
-1. 40 **Mamba-2** blocks bring in context through a memory of fixed size;
-2. 8 **attention** blocks bring in context by looking back at every earlier token;
-3. 40 **MoE** blocks transform the token with a few experts chosen for it.
-
-At the end the model gives a score to each of the 131,072 tokens of its vocabulary, and one of them is picked.
+At the end the model gives a score to each of the 100,352 tokens of its vocabulary, and one of them is picked.
 
 ## Tokens in, tokens out
 
-A tokenizer splits the text into tokens. Each token starts as a list of 4,096 numbers looked up in a table (the *embedding*). After the last block, the *LM head* turns the final numbers back into a score for every token of the vocabulary. The scores become probabilities, and the next token is drawn from them.
+A tokenizer splits the text into tokens. Each token starts as a list of 3,072 numbers looked up in a table (the *embedding*). After the last layer, the *LM head* turns the final numbers back into a score for every token of the vocabulary. The scores become probabilities, and the next token is drawn from them.
 
-## Two ways of looking at the past
+## Two kinds of attention
 
-### Mamba-2: a compact memory (40 blocks)
+Attention compares the current token with earlier ones and pulls in what is relevant. Its cost grows with the length of the text, so Laguna mixes two kinds:
+- **global layers** (one in four, 12 in all) look at the whole context. They use 48 query heads, and their position encoding (RoPE, stretched with YaRN to a million tokens) covers half of each head;
+- **sliding layers** (the other 36) look only at the last 512 tokens, with 72 query heads.
 
-A Mamba-2 block keeps a memory of fixed size instead of looking back at the tokens. The memory has 128 heads; each head stores a 64 × 128 table. For each new token:
-- a short convolution mixes the token with the three before it;
-- the memory fades a little, more or less depending on the token (the *step size*);
-- the token writes into the memory what it carries, keyed by a 128-wide vector (*B*), and reads out what it needs with another one (*C*);
-- the output is normalized and gated by the token itself, then projected back.
+All layers share 8 key/value heads among their query heads (*grouped-query attention*). Every head's output is scaled by a learned gate that depends on the token, so a head can switch itself off when it has nothing useful to add.
 
-The cost per token is the same at token 10 as at token 100,000. The price is that the memory is a summary: it cannot quote an earlier passage word for word.
+The sliding layers keep the memory of a long conversation small: their caches hold a fixed window, and only the 12 global layers grow with the context.
 
-### Attention (8 blocks)
+## Mixture of experts
 
-Eight blocks, spread through the model, use real attention, which can retrieve exact earlier tokens. 32 query heads share 2 key/value heads, and there is no positional encoding: the Mamba blocks already know where a token is. Attention reads every earlier token, so its cost grows with the length of the text, but only 8 blocks pay it.
+From layer 1 on, the transformation is done by 256 small networks, the *experts*. A *router* scores all of them for the token (a sigmoid per expert); the 10 best are chosen, and their answers are weighted by their scores. One more network, the *shared expert*, always runs.
 
-Together, the Mamba blocks carry the gist of a long text cheaply, and the attention blocks fetch exact details when they are needed.
+The experts hold 113 of the 118 billion parameters, but a token uses only 10 of the 256 in each layer. This is why inferenZ can keep the experts on the SSD and only the ones in use in RAM ([STREAMING.md](STREAMING.md)).
 
-## Mixture of experts (LatentMoE)
+## No built-in drafter
 
-Each MoE block has 512 small networks, the *experts*. A *router* scores all of them for the token (a sigmoid per expert); the 22 best are chosen, and their answers are weighted by their scores. The experts do not work on the 4,096 numbers of the token directly: a projection first compresses the token to 1,024 numbers (the *latent*), the experts work there, and a second projection brings their weighted sum back to 4,096. One more network, the *shared expert*, always runs on the full token.
-
-The experts hold 113 of the 120 billion parameters, but a token uses only 22 of the 512 in each block. This is why inferenZ can keep the experts on the SSD and only the ones in use in RAM ([STREAMING.md](STREAMING.md)).
-
-## MTP (speculative decoding)
-
-The model comes with one extra attention block and one extra MoE block, trained to guess the token after the next one (*multi-token prediction*). inferenZ uses them to draft a token cheaply. The main model then checks the draft and produces its own next token in a single pass. When the draft is right, two tokens come out for little more than the cost of one. The output is exactly what the model would have written without the draft ([SPECULATIVE.md](SPECULATIVE.md)).
+Laguna has no multi-token prediction head. Poolside's speculative decoding uses a separate draft model (DFlash), which inferenZ does not run, so Laguna generates one token per step.
 
 ## In numbers
 
 | | |
 |---|---|
-| parameters | 120 B, 113 B of them in experts; about 12 B used per token |
-| blocks | 88: 40 Mamba-2, 40 MoE, 8 attention, plus the MTP blocks |
-| numbers per token | 4,096 (1,024 inside the experts) |
-| experts | 512 per MoE block, 22 chosen per token, plus 1 shared |
-| vocabulary | 131,072 tokens |
+| parameters | 118 B, 113 B of them in experts; about 8.5 B used per token |
+| layers | 48: 12 global attention, 36 sliding-window attention (512 tokens) |
+| numbers per token | 3,072 |
+| experts | 256 per layer (layers 1-47), 10 chosen per token, plus 1 shared |
+| vocabulary | 100,352 tokens |
+| context | up to 1M tokens |
 
 ## The official weights
 
-NVIDIA publishes the model in two precisions. inferenZ uses the NVFP4 release (75 GB), which NVIDIA trained by distillation from the BF16 weights and whose published benchmarks match them:
-- the experts and the shared experts in NVFP4: numbers of 4 bits, with a scale for every 16 of them;
-- the Mamba and attention projections and the LM head in FP8: numbers of 8 bits, with one scale per matrix;
-- everything else in BF16, numbers of 16 bits.
+Poolside publishes BF16, FP8, INT4 and NVFP4 releases. inferenZ uses the NVFP4 one (100 GB):
+- the experts of layers 1-39 in NVFP4: numbers of 4 bits with a scale for every 16 of them, quantized after training;
+- the experts of layers 40-47, which the quantized releases keep at full precision, and everything else in BF16.
 
-inferenZ converts them once into its own file, keeping every number exactly as published ([QUANTIZATION.md](QUANTIZATION.md)).
+inferenZ converts them once into its own file: the NVFP4 experts exactly as published, the rest at 8 bits ([QUANTIZATION.md](QUANTIZATION.md)).

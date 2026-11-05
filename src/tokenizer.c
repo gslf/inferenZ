@@ -329,6 +329,7 @@ tokenizer *tok_load_hf_json(const char *path, char *err, size_t errlen) {
             const char *rx = json_str(json_path(x, "pattern.Regex"), "");
             if (strstr(rx, "[\\p{L}\\p{M}]+|\\p{N}|")) split = TOK_SPLIT_QWEN;
             if (strstr(rx, "[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?") && !strstr(rx, "'s")) split = TOK_SPLIT_TEKKEN;
+            if (strstr(rx, "(?:\\r?\\n)+(?!\\r?\\n)")) split = TOK_SPLIT_LAGUNA;
             if (!list) break;
         }
     }
@@ -535,15 +536,16 @@ static int contraction(const ucp *u, int n, int e) {
     return e;
 }
 
-// Qwen (Qwen3.x / Qwen3.8) split:
+// Qwen (Qwen3.x / Qwen3.8) split (Laguna: the same with \p{M} out of the letter class, in the punctuation class):
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
 //   |\s*[\r\n]+|\s+(?!\S)|\s+
 // Alternatives are tried in order (leftmost-first), so a contraction wins over a longer letter run.
-#define IS_LM(f) ((f) & (UC_L | UC_M))
-static inline bool q4(const ucp *u) { return !(u->f & (UC_WS | UC_L | UC_M | UC_N)); }
+#define IS_LM(f) ((f) & (marks ? (UC_L | UC_M) : UC_L))
+static inline bool q4m(const ucp *u, bool marks) { return !(u->f & (UC_WS | UC_L | (marks ? UC_M : 0) | UC_N)); }
+#define q4(u) q4m(u, marks)
 static inline uint32_t lower_ascii(uint32_t c) { return c >= 'A' && c <= 'Z' ? c | 0x20 : c; }
 
-static int match_at_qwen(const ucp *u, int n, int i) {
+static int match_at_qwen(const ucp *u, int n, int i, bool marks) {
     if (u[i].cp == '\'' && i + 1 < n) {
         const uint32_t c1 = lower_ascii(u[i + 1].cp);
         if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return i + 2;
@@ -715,11 +717,11 @@ static int bpe_word(tokenizer *t, const char *s, int n, int32_t *out) {
 }
 
 static int encode_chunk(tokenizer *t, const char *s, size_t len, int32_t *out, int cap, int count) {
-    // NFC normalize (not Tekken), split, BPE
+    // NFC normalize (o200k and Qwen tokenizers only), split, BPE
     const bool tekken = t->split == TOK_SPLIT_TEKKEN;
     char *norm;
     size_t nl;
-    if (tekken) { norm = inz_malloc(len + 1); memcpy(norm, s, len); norm[len] = 0; nl = len; }
+    if (tekken || t->split == TOK_SPLIT_LAGUNA) { norm = inz_malloc(len + 1); memcpy(norm, s, len); norm[len] = 0; nl = len; }
     else nl = inz_nfc(s, len, &norm);
     ucp *u = inz_malloc(sizeof(ucp) * (nl + 1));
     int n = 0;
@@ -734,8 +736,25 @@ static int encode_chunk(tokenizer *t, const char *s, size_t len, int32_t *out, i
     }
     u[n].off = (uint32_t)nl;
     int32_t tmp_small[256];
+    int piece_end = 0;  // Laguna: end of the current newline-run piece
     for (int i = 0; i < n;) {
-        int e = t->split == TOK_SPLIT_QWEN ? match_at_qwen(u, n, i) : match_at_any(u, n, i, tekken);
+        // Laguna: pieces end where a run of newlines begins (the run opens the next piece)
+        int end = n;
+        if (t->split == TOK_SPLIT_LAGUNA) {
+            end = i + 1;
+            while (end < n && !(u[end].cp == '\n' || (u[end].cp == '\r' && end + 1 < n && u[end + 1].cp == '\n')) ) end++;
+            // a run starting at i is part of this piece: skip over it before looking for the next one
+            if (u[i].cp == '\n' || (u[i].cp == '\r' && i + 1 < n && u[i + 1].cp == '\n')) {
+                int k = i;
+                while (k < n && (u[k].cp == '\n' || (u[k].cp == '\r' && k + 1 < n && u[k + 1].cp == '\n'))) k += u[k].cp == '\r' ? 2 : 1;
+                end = k;
+                while (end < n && !(u[end].cp == '\n' || (u[end].cp == '\r' && end + 1 < n && u[end + 1].cp == '\n'))) end++;
+            }
+            if (piece_end > i) end = piece_end;
+            piece_end = end;
+        }
+        int e = t->split == TOK_SPLIT_QWEN || t->split == TOK_SPLIT_LAGUNA ? match_at_qwen(u, end, i, t->split == TOK_SPLIT_QWEN)
+                                                                          : match_at_any(u, n, i, tekken);
         if (e <= i) e = i + 1;
         const char *ws = norm + u[i].off;
         int wl = (int)(u[e].off - u[i].off);

@@ -11,7 +11,9 @@ typedef struct tokenizer tokenizer;
 
 // TEKKEN (Mistral / Nemotron): no normalizer, single digits, no contractions; a pre-token found whole in the
 // vocabulary is emitted as is ("ignore_merges").
-enum { TOK_SPLIT_O200K = 0, TOK_SPLIT_QWEN = 1, TOK_SPLIT_TEKKEN = 2 };
+// LAGUNA: a cut before every run of newlines (the run starts the next piece), then the Qwen split with combining marks
+// treated as punctuation instead of letters.
+enum { TOK_SPLIT_O200K = 0, TOK_SPLIT_QWEN = 1, TOK_SPLIT_TEKKEN = 2, TOK_SPLIT_LAGUNA = 3 };
 void tok_set_split(tokenizer *t, int split);
 int tok_get_split(const tokenizer *t);
 

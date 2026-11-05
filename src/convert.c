@@ -1,13 +1,12 @@
-// inz convert: the official Nemotron 3.5 Super VL NVFP4 checkpoint (modelopt mixed precision: NVFP4 experts and
-// shared experts, FP8 Mamba and attention projections and LM head, BF16 rest) -> inferenZ GGUF. The vision tower is
-// not converted: the engine runs the language model.
+// inz convert: the official Laguna S 2.1 NVFP4 checkpoint (compressed-tensors: NVFP4 routed experts in layers 1-39,
+// BF16 everything else, including the experts of layers 40-47) -> inferenZ GGUF.
 //
 // The converter streams: it declares every tensor up front, then writes them in order, waiting for each source
-// tensor to finish downloading (tools/hfget.py journal) when needed. By default every tensor keeps its exact
-// checkpoint values: NVFP4 is repacked as Q4N, FP8 copied as F8T, BF16 matrices stored as F16 (F16 has more
-// mantissa bits; only magnitudes below 6e-5 lose relative precision, by less than 3e-8 in absolute terms). Routed
-// experts are written as one 4 KiB-aligned blob per expert (up, down), so the runtime fetches a missed expert with
-// one O_DIRECT read.
+// tensor to finish downloading (tools/hfget.py journal) when needed. The NVFP4 experts are repacked exactly as Q4N
+// (gate and up share their global scale, so they fuse into one gate|up matrix). The BF16 tensors are stored in the
+// recipe's formats (default: 8-bit Q8G for the large matrices, F16 for the router and the embeddings). Routed experts
+// are written as one 4 KiB-aligned blob per expert (gate|up, down), so the runtime fetches a missed expert with one
+// O_DIRECT read.
 #define _GNU_SOURCE
 #include "convert.h"
 
@@ -26,8 +25,7 @@
 #include "tokenizer.h"
 #include "util.h"
 
-#define SRC "language_model.backbone."
-#define SRC_MTP "language_model.mtp."
+#define SRC "model."
 
 /* ------------------------------------------------------------------ */
 /* Source decoding                                                     */
@@ -173,14 +171,13 @@ static const float *imx_get(const char *name, int cols) {
 
 void convert_opts_default(convert_opts *o) {
     memset(o, 0, sizeof(*o));
-    o->t_mamba = INZ_T_F8T;
-    o->t_attn = INZ_T_F8T;
-    o->t_shared = INZ_T_Q4N;
-    o->t_latent = INZ_T_F16;
+    o->t_attn = INZ_T_Q8G;
+    o->t_dense = INZ_T_Q8G;
+    o->t_shared = INZ_T_Q8G;
     o->t_router = INZ_T_F16;
-    o->t_mtp = INZ_T_F16;
     o->t_experts = INZ_T_Q4N;
-    o->t_head = INZ_T_F8T;
+    o->t_experts_bf16 = INZ_T_Q8G;
+    o->t_head = INZ_T_Q8G;
     o->t_embed = INZ_T_F16;
     o->max_layers = Q_N_LAYER;
 }
@@ -205,7 +202,7 @@ static void declare_f32(cvt *c, const char *name, int n) {
 }
 
 uint64_t convert_expert_blob_bytes(int type) {
-    uint64_t b = mat_bytes(type, Q_FF, Q_LAT) + mat_bytes(type, Q_LAT, Q_FF);
+    uint64_t b = mat_bytes(type, 2 * Q_FF, Q_H) + mat_bytes(type, Q_H, Q_FF);
     return INZ_ALIGN_UP(b, 4096);
 }
 
@@ -282,71 +279,128 @@ static void progress(cvt *c, const char *what) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Blocks                                                              */
+/* Layers                                                              */
 /* ------------------------------------------------------------------ */
 
-// dst: "blk.N", "mtp.at" or "mtp.moe"; t_attn: attention storage (FP8 in the model, BF16 in the MTP layer)
-static void declare_block(cvt *c, const char *dst, int kind, int t_attn) {
+static void declare_layer(cvt *c, int l) {
     const convert_opts *o = c->o;
     char n[96];
-#define D(suffix) (snprintf(n, sizeof(n), "%s." suffix, dst), n)
-    declare_f32(c, D("norm"), Q_H);
-    if (kind == QB_MAMBA) {
-        declare_mat(c, D("mb.in"), o->t_mamba, Q_MB_PROJ, Q_H);
-        declare_mat(c, D("mb.out"), o->t_mamba, Q_H, Q_MB_INNER);
-        declare_mat(c, D("mb.conv"), INZ_T_F32, Q_MB_CONV, Q_MB_KS);
-        declare_f32(c, D("mb.conv_bias"), Q_MB_CONV);
-        declare_f32(c, D("mb.A_log"), Q_MB_NH);
-        declare_f32(c, D("mb.D"), Q_MB_NH);
-        declare_f32(c, D("mb.dt_bias"), Q_MB_NH);
-        declare_f32(c, D("mb.norm"), Q_MB_INNER);
-    } else if (kind == QB_ATTN) {
-        declare_mat(c, D("at.q"), t_attn, Q_QD, Q_H);
-        declare_mat(c, D("at.k"), t_attn, Q_KV, Q_H);
-        declare_mat(c, D("at.v"), t_attn, Q_KV, Q_H);
-        declare_mat(c, D("at.o"), t_attn, Q_H, Q_QD);
+    const int nh = q_nh(l);
+#define D(suffix) (snprintf(n, sizeof(n), "blk.%d." suffix, l), n)
+    declare_f32(c, D("attn_norm"), Q_H);
+    declare_f32(c, D("mlp_norm"), Q_H);
+    declare_mat(c, D("at.q"), o->t_attn, nh * Q_HD, Q_H);
+    declare_mat(c, D("at.k"), o->t_attn, Q_KV, Q_H);
+    declare_mat(c, D("at.v"), o->t_attn, Q_KV, Q_H);
+    declare_mat(c, D("at.o"), o->t_attn, Q_H, nh * Q_HD);
+    declare_mat(c, D("at.g"), o->t_attn, nh, Q_H);
+    declare_f32(c, D("at.q_norm"), Q_HD);
+    declare_f32(c, D("at.k_norm"), Q_HD);
+    if (l == 0) {
+        declare_mat(c, D("mlp.gate_up"), o->t_dense, 2 * Q_DENSE_FF, Q_H);
+        declare_mat(c, D("mlp.down"), o->t_dense, Q_H, Q_DENSE_FF);
     } else {
         declare_mat(c, D("router"), o->t_router, Q_N_EXPERT, Q_H);
         declare_f32(c, D("router_bias"), Q_N_EXPERT);
-        declare_mat(c, D("lat_in"), o->t_latent, Q_LAT, Q_H);
-        declare_mat(c, D("lat_out"), o->t_latent, Q_H, Q_LAT);
-        declare_mat(c, D("sh.up"), o->t_shared, Q_SHARED_FF, Q_H);
+        declare_mat(c, D("sh.gate_up"), o->t_shared, 2 * Q_SHARED_FF, Q_H);
         declare_mat(c, D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF);
     }
 #undef D
 }
 
-// src: the checkpoint prefix of the block ("language_model.backbone.layers.N." or "language_model.mtp.layers.0.")
-static void write_block(cvt *c, const char *src, const char *dst, int kind, int t_attn) {
+// gate and up rows fused into one matrix
+static void write_gate_up(cvt *c, const char *gsrc, const char *usrc, const char *dst, int type, int ff) {
+    int64_t r, cc;
+    float *G = load(c->m, gsrc, &r, &cc), *U = load(c->m, usrc, &r, &cc);
+    float *GU = inz_malloc(sizeof(float) * 2 * (size_t)ff * Q_H);
+    memcpy(GU, G, sizeof(float) * (size_t)ff * Q_H);
+    memcpy(GU + (size_t)ff * Q_H, U, sizeof(float) * (size_t)ff * Q_H);
+    const uint64_t nb = mat_bytes(type, 2 * ff, Q_H);
+    void *buf = inz_aligned(64, nb);
+    encode(GU, 2 * ff, Q_H, type, c->o->threads, imx_get(dst, Q_H), buf);
+    put(c, buf, nb);
+    free(buf); free(G); free(U); free(GU);
+}
+
+static void write_layer(cvt *c, int l) {
     const convert_opts *o = c->o;
-    char n[256], d[96];
-#define S(suffix) (snprintf(n, sizeof(n), "%s" suffix, src), n)
-#define D(suffix) (snprintf(d, sizeof(d), "%s." suffix, dst), d)
-    write_vec(c, S("norm.weight"), Q_H);
-    if (kind == QB_MAMBA) {
-        write_mat(c, S("mixer.in_proj.weight"), D("mb.in"), o->t_mamba, Q_MB_PROJ, Q_H);
-        write_mat(c, S("mixer.out_proj.weight"), D("mb.out"), o->t_mamba, Q_H, Q_MB_INNER);
-        write_mat(c, S("mixer.conv1d.weight"), NULL, INZ_T_F32, Q_MB_CONV, Q_MB_KS);
-        write_vec(c, S("mixer.conv1d.bias"), Q_MB_CONV);
-        write_vec(c, S("mixer.A_log"), Q_MB_NH);
-        write_vec(c, S("mixer.D"), Q_MB_NH);
-        write_vec(c, S("mixer.dt_bias"), Q_MB_NH);
-        write_vec(c, S("mixer.norm.weight"), Q_MB_INNER);
-    } else if (kind == QB_ATTN) {
-        write_mat(c, S("mixer.q_proj.weight"), D("at.q"), t_attn, Q_QD, Q_H);
-        write_mat(c, S("mixer.k_proj.weight"), D("at.k"), t_attn, Q_KV, Q_H);
-        write_mat(c, S("mixer.v_proj.weight"), D("at.v"), t_attn, Q_KV, Q_H);
-        write_mat(c, S("mixer.o_proj.weight"), D("at.o"), t_attn, Q_H, Q_QD);
+    char n[256], n2[256], d[96];
+    const int nh = q_nh(l);
+#define S(suffix) (snprintf(n, sizeof(n), SRC "layers.%d." suffix, l), n)
+#define S2(suffix) (snprintf(n2, sizeof(n2), SRC "layers.%d." suffix, l), n2)
+#define D(suffix) (snprintf(d, sizeof(d), "blk.%d." suffix, l), d)
+    write_vec(c, S("input_layernorm.weight"), Q_H);
+    write_vec(c, S("post_attention_layernorm.weight"), Q_H);
+    write_mat(c, S("self_attn.q_proj.weight"), D("at.q"), o->t_attn, nh * Q_HD, Q_H);
+    write_mat(c, S("self_attn.k_proj.weight"), D("at.k"), o->t_attn, Q_KV, Q_H);
+    write_mat(c, S("self_attn.v_proj.weight"), D("at.v"), o->t_attn, Q_KV, Q_H);
+    write_mat(c, S("self_attn.o_proj.weight"), D("at.o"), o->t_attn, Q_H, nh * Q_HD);
+    write_mat(c, S("self_attn.g_proj.weight"), D("at.g"), o->t_attn, nh, Q_H);
+    write_vec(c, S("self_attn.q_norm.weight"), Q_HD);
+    write_vec(c, S("self_attn.k_norm.weight"), Q_HD);
+    if (l == 0) {
+        write_gate_up(c, S("mlp.gate_proj.weight"), S2("mlp.up_proj.weight"), D("mlp.gate_up"), o->t_dense, Q_DENSE_FF);
+        write_mat(c, S("mlp.down_proj.weight"), D("mlp.down"), o->t_dense, Q_H, Q_DENSE_FF);
     } else {
-        write_mat(c, S("mixer.gate.weight"), D("router"), o->t_router, Q_N_EXPERT, Q_H);
-        write_vec(c, S("mixer.gate.e_score_correction_bias"), Q_N_EXPERT);
-        write_mat(c, S("mixer.fc1_latent_proj.weight"), D("lat_in"), o->t_latent, Q_LAT, Q_H);
-        write_mat(c, S("mixer.fc2_latent_proj.weight"), D("lat_out"), o->t_latent, Q_H, Q_LAT);
-        write_mat(c, S("mixer.shared_experts.up_proj.weight"), D("sh.up"), o->t_shared, Q_SHARED_FF, Q_H);
-        write_mat(c, S("mixer.shared_experts.down_proj.weight"), D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF);
+        write_mat(c, S("mlp.gate.weight"), D("router"), o->t_router, Q_N_EXPERT, Q_H);
+        write_vec(c, S("mlp.experts.e_score_correction_bias"), Q_N_EXPERT);
+        write_gate_up(c, S("mlp.shared_expert.gate_proj.weight"), S2("mlp.shared_expert.up_proj.weight"), D("sh.gate_up"),
+                      o->t_shared, Q_SHARED_FF);
+        write_mat(c, S("mlp.shared_expert.down_proj.weight"), D("sh.down"), o->t_shared, Q_H, Q_SHARED_FF);
     }
 #undef S
+#undef S2
 #undef D
+}
+
+// One routed expert into out (blob layout: gate|up, then down). A compressed-tensors NVFP4 expert (weight_packed,
+// weight_scale per 16, weight_global_scale shared by gate and up) is repacked exactly as Q4N; a BF16 expert is
+// encoded as `type`.
+static void write_expert(st_model *m, const char *base, int e, int type, const char *dbase, void *out) {
+    char a[512], b[512], dn[96];
+    snprintf(a, sizeof(a), "%s%d.gate_proj.weight_packed", base, e);
+    if (st_find(m, a)) {
+        if (type != INZ_T_Q4N) inz_die("convert: NVFP4 experts can only be repacked as Q4N");
+        static const char *nm[3] = {"gate_proj", "up_proj", "down_proj"};
+        uint8_t *pk[3], *sc[3];
+        float gs[3];
+        for (int w = 0; w < 3; w++) {
+            const st_tensor *t = need(m, "%s%d.%s.weight_packed", base, e, nm[w]);
+            const st_tensor *ts = need(m, "%s%d.%s.weight_scale", base, e, nm[w]);
+            const st_tensor *tg = need(m, "%s%d.%s.weight_global_scale", base, e, nm[w]);
+            if (t->dtype != ST_U8 || ts->dtype != ST_F8_E4M3 || tg->dtype != ST_F32 || st_numel(tg) != 1)
+                inz_die("convert: %s is not compressed-tensors NVFP4", t->name);
+            pk[w] = read_all(m, t);
+            sc[w] = read_all(m, ts);
+            if (!st_read(m, tg, &gs[w])) inz_die("convert: read failed for %s", tg->name);
+        }
+        if (gs[0] != gs[1]) inz_die("convert: %sexperts.%d gate and up have different global scales", base, e);
+        // gate rows, then up rows: same global scale, so one Q4N matrix holds both exactly
+        const size_t pkr = (size_t)Q_FF * Q_H / 2, scr = (size_t)Q_FF * Q_H / 16;
+        uint8_t *gpk = inz_malloc(2 * pkr), *gsc = inz_malloc(2 * scr);
+        memcpy(gpk, pk[0], pkr); memcpy(gpk + pkr, pk[1], pkr);
+        memcpy(gsc, sc[0], scr); memcpy(gsc + scr, sc[1], scr);
+        if (!inz_pack_q4n(gpk, gsc, gs[0], 2 * Q_FF, Q_H, out) ||
+            !inz_pack_q4n(pk[2], sc[2], gs[2], Q_H, Q_FF, (uint8_t *)out + mat_bytes(INZ_T_Q4N, 2 * Q_FF, Q_H)))
+            inz_die("convert: %sexperts.%d has a negative or NaN block scale", base, e);
+        free(gpk); free(gsc);
+        for (int w = 0; w < 3; w++) { free(pk[w]); free(sc[w]); }
+        return;
+    }
+    int64_t r, cc;
+    snprintf(a, sizeof(a), "%s%d.gate_proj.weight", base, e);
+    snprintf(b, sizeof(b), "%s%d.up_proj.weight", base, e);
+    float *G = load(m, a, &r, &cc), *U = load(m, b, &r, &cc);
+    float *GU = inz_malloc(sizeof(float) * 2 * Q_FF * Q_H);
+    memcpy(GU, G, sizeof(float) * Q_FF * Q_H);
+    memcpy(GU + (size_t)Q_FF * Q_H, U, sizeof(float) * Q_FF * Q_H);
+    snprintf(dn, sizeof(dn), "%s%d.gate_up", dbase, e);
+    encode(GU, 2 * Q_FF, Q_H, type, 1, imx_get(dn, Q_H), out);
+    snprintf(a, sizeof(a), "%s%d.down_proj.weight", base, e);
+    float *D = load(m, a, &r, &cc);
+    snprintf(dn, sizeof(dn), "%s%d.down", dbase, e);
+    encode(D, Q_H, Q_FF, type, 1, imx_get(dn, Q_FF), (uint8_t *)out + mat_bytes(type, 2 * Q_FF, Q_H));
+    free(G); free(U); free(GU); free(D);
 }
 
 /* ------------------------------------------------------------------ */
@@ -370,24 +424,28 @@ int convert_run(const convert_opts *o) {
     c.w = gguf_writer_new(o->out_path, 4096);
     if (!c.w) { fprintf(stderr, "inz convert: cannot create %s\n", o->out_path); return 1; }
     const int NL = o->max_layers > 0 && o->max_layers < Q_N_LAYER ? o->max_layers : Q_N_LAYER;
-    int n_moe = 0;
-    for (int l = 0; l < NL; l++) n_moe += q_kind(l) == QB_MOE;
+    // expert storage per layer: NVFP4 layers keep Q4N, the checkpoint's BF16 layers get t_experts_bf16
+    int32_t xtype[Q_N_LAYER] = {0};
+    for (int l = 1; l < NL; l++) {
+        char name[256];
+        snprintf(name, sizeof(name), SRC "layers.%d.mlp.experts.0.gate_proj.weight_packed", l);
+        xtype[l] = st_find(m, name) ? o->t_experts : o->t_experts_bf16;
+    }
 
     // ---------------- metadata ----------------
     gguf_w_str(c.w, "general.architecture", Q_ARCH);
-    gguf_w_str(c.w, "general.name", "NVIDIA Nemotron 3.5 Super 120B-A12B (inferenZ)");
+    gguf_w_str(c.w, "general.name", "Poolside Laguna S 2.1 (inferenZ)");
     gguf_w_str(c.w, "inz.version", INZ_VERSION);
     gguf_w_u32(c.w, "inz.n_layer", (uint32_t)NL);
     gguf_w_u32(c.w, "inz.n_layer_full", Q_N_LAYER);
     gguf_w_u32(c.w, "inz.n_embd", Q_H);
     gguf_w_u32(c.w, "inz.n_expert", Q_N_EXPERT);
-    gguf_w_u32(c.w, "inz.expert_type", (uint32_t)o->t_experts);
-    gguf_w_u64(c.w, "inz.expert_blob_bytes", convert_expert_blob_bytes(o->t_experts));
+    gguf_w_arr_i32(c.w, "inz.expert_types", xtype, (uint64_t)NL);
     char recipe[256];
-    snprintf(recipe, sizeof(recipe), "mamba=%s attn=%s shared=%s latent=%s router=%s mtp=%s experts=%s head=%s embed=%s%s",
-             inz_qtype_name(o->t_mamba), inz_qtype_name(o->t_attn), inz_qtype_name(o->t_shared), inz_qtype_name(o->t_latent),
-             inz_qtype_name(o->t_router), inz_qtype_name(o->t_mtp), inz_qtype_name(o->t_experts), inz_qtype_name(o->t_head),
-             inz_qtype_name(o->t_embed), o->imatrix ? " imatrix" : "");
+    snprintf(recipe, sizeof(recipe), "experts=%s experts_bf16=%s attn=%s dense=%s shared=%s router=%s head=%s embed=%s%s",
+             inz_qtype_name(o->t_experts), inz_qtype_name(o->t_experts_bf16), inz_qtype_name(o->t_attn), inz_qtype_name(o->t_dense),
+             inz_qtype_name(o->t_shared), inz_qtype_name(o->t_router), inz_qtype_name(o->t_head), inz_qtype_name(o->t_embed),
+             o->imatrix ? " imatrix" : "");
     gguf_w_str(c.w, "inz.recipe", recipe);
     if (tmpl) gguf_w_str(c.w, "tokenizer.chat_template", tmpl);
     gguf_w_u32(c.w, "tokenizer.split", (uint32_t)tok_get_split(tok));
@@ -417,103 +475,63 @@ int convert_run(const convert_opts *o) {
     }
 
     // ---------------- declarations ----------------
-    // MTP: an attention block and a MoE block for speculative decoding ("mtp.*", experts "mtp.experts")
-    const bool with_mtp = NL == Q_N_LAYER && st_find(m, SRC_MTP "layers.0.eh_proj.weight");
     char name[256];
     declare_mat(&c, "token_embd.weight", o->t_embed, Q_VOCAB, Q_H);
     declare_mat(&c, "output.weight", o->t_head, Q_VOCAB, Q_H);
     declare_f32(&c, "output_norm", Q_H);
-    for (int l = 0; l < NL; l++) {
-        snprintf(name, sizeof(name), "blk.%d", l);
-        declare_block(&c, name, q_kind(l), o->t_attn);
-    }
-    if (with_mtp) {
-        declare_mat(&c, "mtp.eh", o->t_mtp, Q_H, 2 * Q_H);
-        declare_f32(&c, "mtp.enorm", Q_H);
-        declare_f32(&c, "mtp.hnorm", Q_H);
-        declare_f32(&c, "mtp.final_norm", Q_H);
-        declare_block(&c, "mtp.at", QB_ATTN, o->t_mtp);
-        declare_block(&c, "mtp.moe", QB_MOE, o->t_mtp);
-        gguf_w_u32(c.w, "inz.mtp_layers", Q_MTP_LAYERS);
-    }
+    for (int l = 0; l < NL; l++) declare_layer(&c, l);
     // experts last: they arrive last from the download and dominate the file
-    const uint64_t blob = convert_expert_blob_bytes(o->t_experts);
-    for (int k = 0; k <= n_moe; k++) {
-        if (k == n_moe && !with_mtp) break;
+    for (int l = 1; l < NL; l++) {
+        const uint64_t blob = convert_expert_blob_bytes(xtype[l]);
         uint64_t ne[2] = {blob, Q_N_EXPERT};
-        if (k < n_moe) snprintf(name, sizeof(name), "moe.%d.experts", k);
-        else snprintf(name, sizeof(name), "mtp.experts");
+        snprintf(name, sizeof(name), "blk.%d.experts", l);
         gguf_w_tensor(c.w, name, INZ_T_EXPERTS, 2, ne, blob * Q_N_EXPERT);
     }
     if (!gguf_w_header(c.w)) inz_die("convert: header write failed");
     progress(&c, "header written");
 
     // ---------------- data ----------------
-    write_mat(&c, SRC "embeddings.weight", NULL, o->t_embed, Q_VOCAB, Q_H);
-    write_mat(&c, "language_model.lm_head.weight", "output.weight", o->t_head, Q_VOCAB, Q_H);
-    write_vec(&c, SRC "norm_f.weight", Q_H);
+    write_mat(&c, SRC "embed_tokens.weight", NULL, o->t_embed, Q_VOCAB, Q_H);
+    write_mat(&c, "lm_head.weight", "output.weight", o->t_head, Q_VOCAB, Q_H);
+    write_vec(&c, SRC "norm.weight", Q_H);
     progress(&c, "embeddings and head");
     for (int l = 0; l < NL; l++) {
-        char src[128], dst[32];
-        snprintf(src, sizeof(src), SRC "layers.%d.", l);
-        snprintf(dst, sizeof(dst), "blk.%d", l);
-        write_block(&c, src, dst, q_kind(l), o->t_attn);
+        write_layer(&c, l);
         if (l % 8 == 7 || l == NL - 1) {
             char msg[64];
-            snprintf(msg, sizeof(msg), "blocks 0-%d dense part", l);
+            snprintf(msg, sizeof(msg), "layers 0-%d dense part", l);
             progress(&c, msg);
         }
     }
-    if (with_mtp) {
-        write_mat(&c, SRC_MTP "layers.0.eh_proj.weight", "mtp.eh", o->t_mtp, Q_H, 2 * Q_H);
-        write_vec(&c, SRC_MTP "layers.0.enorm.weight", Q_H);
-        write_vec(&c, SRC_MTP "layers.0.hnorm.weight", Q_H);
-        write_vec(&c, SRC_MTP "layers.1.final_layernorm.weight", Q_H);
-        write_block(&c, SRC_MTP "layers.0.", "mtp.at", QB_ATTN, o->t_mtp);
-        write_block(&c, SRC_MTP "layers.1.", "mtp.moe", QB_MOE, o->t_mtp);
-        progress(&c, "MTP dense part");
-    }
 
     // ---------------- experts ----------------
-    const int et = o->t_experts;
-    const uint64_t b_up = mat_bytes(et, Q_FF, Q_LAT);
-    uint8_t *layer_buf = inz_aligned(4096, blob * Q_N_EXPERT);
-    for (int k = 0, l = 0; k <= n_moe; k++) {
-        if (k == n_moe && !with_mtp) break;
+    uint8_t *layer_buf = inz_aligned(4096, convert_expert_blob_bytes(o->t_experts_bf16 > 0 ? o->t_experts_bf16 : o->t_experts) * Q_N_EXPERT +
+                                               convert_expert_blob_bytes(o->t_experts) * Q_N_EXPERT);
+    for (int l = 1; l < NL; l++) {
+        const uint64_t blob = convert_expert_blob_bytes(xtype[l]);
         char base[128], dbase[32];
-        if (k < n_moe) {
-            while (q_kind(l) != QB_MOE) l++;
-            snprintf(base, sizeof(base), SRC "layers.%d.mixer.experts.", l++);
-            snprintf(dbase, sizeof(dbase), "moe.%d.experts.", k);
-        } else {
-            snprintf(base, sizeof(base), SRC_MTP "layers.1.mixer.experts.");
-            snprintf(dbase, sizeof(dbase), "mtp.experts.");
-        }
+        snprintf(base, sizeof(base), SRC "layers.%d.mlp.experts.", l);
+        snprintf(dbase, sizeof(dbase), "blk.%d.experts.", l);
         // wait for the whole layer first (the reads below run in parallel)
-        static const char *nm[2] = {"up_proj", "down_proj"};
-        for (int e = 0; e < Q_N_EXPERT; e++)
-            for (int w = 0; w < 2; w++) {
-                need(m, "%s%d.%s.weight", base, e, nm[w]);
-                need(m, "%s%d.%s.weight_scale", base, e, nm[w]);
-                need(m, "%s%d.%s.weight_scale_2", base, e, nm[w]);
+        for (int e = 0; e < Q_N_EXPERT; e++) {
+            static const char *nm[3] = {"gate_proj", "up_proj", "down_proj"};
+            for (int w = 0; w < 3; w++) {
+                char t[512];
+                snprintf(t, sizeof(t), "%s%d.%s.weight_packed", base, e, nm[w]);
+                if (st_find(m, t)) {
+                    need(m, "%s", t);
+                    need(m, "%s%d.%s.weight_scale", base, e, nm[w]);
+                    need(m, "%s%d.%s.weight_global_scale", base, e, nm[w]);
+                } else need(m, "%s%d.%s.weight", base, e, nm[w]);
             }
+        }
         memset(layer_buf, 0, blob * Q_N_EXPERT);
         int nthreads = o->threads > 0 ? o->threads : omp_get_max_threads();
         #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1)
-        for (int e = 0; e < Q_N_EXPERT; e++) {
-            char src[512], dst[64];
-            uint8_t *out = layer_buf + (size_t)e * blob;
-            snprintf(src, sizeof(src), "%s%d.up_proj.weight", base, e);
-            snprintf(dst, sizeof(dst), "%s%d.up", dbase, e);
-            convert_mat(m, src, dst, et, Q_FF, Q_LAT, 1, out);
-            snprintf(src, sizeof(src), "%s%d.down_proj.weight", base, e);
-            snprintf(dst, sizeof(dst), "%s%d.down", dbase, e);
-            convert_mat(m, src, dst, et, Q_LAT, Q_FF, 1, out + b_up);
-        }
+        for (int e = 0; e < Q_N_EXPERT; e++) write_expert(m, base, e, xtype[l], dbase, layer_buf + (size_t)e * blob);
         put(&c, layer_buf, blob * Q_N_EXPERT);
-        char msg[64];
-        if (k < n_moe) snprintf(msg, sizeof(msg), "MoE block %d experts (%.2f MiB/expert)", k, blob / 1048576.0);
-        else snprintf(msg, sizeof(msg), "MTP experts");
+        char msg[80];
+        snprintf(msg, sizeof(msg), "layer %d experts (%s, %.2f MiB/expert)", l, inz_qtype_name(xtype[l]), blob / 1048576.0);
         progress(&c, msg);
     }
     free(layer_buf);

@@ -17,8 +17,8 @@ The request is standard OpenAI chat. Supported fields:
 |---|---|
 | `messages` | `system`, `developer`, `user`, `assistant` (with `reasoning_content` / `tool_calls`), `tool` |
 | `tools` | OpenAI function tools, rendered into the model's tool prompt |
-| `reasoning_effort` | `high` (default: thinking on), `medium` or `low` (the template's efficient thinking), or `none` to disable thinking. Also `reasoning.effort` |
-| `temperature`, `top_p`, `top_k`, `min_p` | defaults 1.0 / 0.95 / off / off, from the model's `generation_config.json` (top-p over the whole vocabulary) |
+| `reasoning_effort` | `none` disables thinking; any other value (default `high`) keeps it on: Laguna has no intermediate level. Also `reasoning.effort` |
+| `temperature`, `top_p`, `top_k`, `min_p` | defaults 1.0 / 1.0 / 20 / off, from the model's `generation_config.json` |
 | `presence_penalty`, `frequency_penalty`, `repeat_penalty`, `seed` | |
 | `max_tokens` / `max_completion_tokens` | default 32768 (thinking at high effort can be long) |
 | `stop` | string or array |
@@ -28,7 +28,7 @@ The request is standard OpenAI chat. Supported fields:
 The model's output is parsed into OpenAI fields:
 - the `<think>…</think>` block becomes `reasoning_content`, streamed as `delta.reasoning_content`;
 - the rest becomes `content`;
-- `<tool_call><function=NAME><parameter=K>V</parameter>…</function></tool_call>` blocks become `tool_calls`. Each parameter is converted to the JSON type its schema declares.
+- `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>` blocks become `tool_calls`. Each argument is converted to the JSON type its schema declares.
 
 The prompt is rendered by a C port of the official `chat_template.jinja`. It is byte-identical to the Jinja reference on the test suite in `tests/chat_parity.py`. Earlier assistant turns keep their reasoning, as the template does by default.
 
@@ -44,7 +44,7 @@ Every response, streamed or not, ends with a `timings` object (an inferenZ exten
 
 The engine keeps the state of the previous request. Chat clients resend the whole history, so the new request usually extends the old one; then only the new tokens are processed.
 
-The attention caches are positional and are simply truncated. The recurrent Mamba-2 state cannot be rewound token by token. It is therefore checkpointed before the last prompt token of every request, and a request that diverges after that point restarts from the checkpoint. Any other divergence recomputes the prompt.
+The attention caches are positional and are simply truncated. Laguna has no recurrent state, so a request that diverges from the previous one rewinds to the end of their common prefix, as long as the sliding-window caches still hold it (3584 positions back); otherwise the prompt is recomputed.
 
 ## Tools
 
@@ -56,7 +56,7 @@ Raw text completion: `prompt` is tokenized as-is, with special tokens recognized
 
 ## `GET /v1/models`
 
-Returns the single model id (`nemotron-3.5-super`).
+Returns the single model id (`laguna-s-2.1`).
 
 ## Diagnostics
 

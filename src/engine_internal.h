@@ -1,4 +1,4 @@
-// Engine internals shared by engine.c and model_fwd.c (Nemotron 3.5 Super).
+// Engine internals shared by engine.c and model_fwd.c (Laguna S 2.1).
 #ifndef INZ_ENGINE_INTERNAL_H
 #define INZ_ENGINE_INTERNAL_H
 
@@ -24,45 +24,43 @@ typedef struct {
 // Importance matrix (INZ_IMATRIX=file): mean squared input of every column of every matrix, for the quantizer.
 typedef struct { char name[48]; int cols; uint64_t n; double *acc; } imx_entry;
 
-// One block: x += mixer(rmsnorm(x) * norm). Only the fields of its kind are bound.
+// The routed experts of one blob class (the layers the official checkpoint quantized, the layers it kept in BF16)
 typedef struct {
-    int kind;                // QB_MAMBA, QB_MOE, QB_ATTN
-    int idx;                 // index among the blocks of its kind (state slot, attention cache, expert cache layer)
-    const float *norm;       // H
-    // Mamba-2
-    lin mb_in, mb_out;       // in_proj (z | x B C | dt) 18560 x H, out_proj H x 8192
-    const float *mb_conv;    // [10240][4]
-    const float *mb_conv_b;  // [10240]
-    float mb_negA[Q_MB_NH];  // -exp(A_log)
-    const float *mb_D, *mb_dt, *mb_norm;  // [128], [128], [8192]
+    ec_cache *ec;
+    int type;                // storage type of the expert matrices
+    uint64_t blob_bytes, gu_bytes;
+    bool all_resident;
+} q_xclass;
+
+typedef struct {
+    int nh;                  // query heads (48 full, 72 sliding)
+    const float *attn_norm, *mlp_norm;   // H
     // attention
-    lin at_q, at_k, at_v, at_o;
+    lin at_q, at_k, at_v, at_o, at_g;    // q nh*128 x H, k/v 1024 x H, o H x nh*128, g nh x H
+    const float *q_norm, *k_norm;        // 128
+    // dense MLP (layer 0)
+    lin d_gu, d_down;        // 2*12288 x H (gate rows, then up rows), H x 12288
     // MoE
-    lin router;              // 512 x H, scores in f32
+    lin router;              // 256 x H, scores in f32
     const float *router_bias;  // e_score_correction_bias: shifts the selection, not the weights
-    lin lat_in, lat_out;     // 1024 x H, H x 1024
-    lin sh_up, sh_down;      // 5376 x H, H x 5376
+    lin sh_gu, sh_down;      // 2*1024 x H, H x 1024
+    q_xclass *xc;            // expert class of this layer
+    int xl;                  // layer index inside that class's cache
 } q_layer;
 
-// MTP: eh_proj of [enorm(embed(next)) | hnorm(hidden)], an attention block and a MoE block, a final norm; the LM
-// head is shared.
-typedef struct {
-    bool present;
-    lin eh;                  // H x 2H
-    const float *enorm, *hnorm, *final_norm;
-    q_layer at, moe;
-} q_mtp;
+// MTP: Laguna has none; the engine keeps the hooks (always absent)
+typedef struct { bool present; } q_mtp;
 
-#define Q_SPEC_MAX 3         // draft tokens per speculative step
+#define Q_SPEC_MAX 3         // draft tokens per speculative step (unused without an MTP head)
 
-// Recurrent and attention state of one sequence.
+// Attention caches of one sequence: f16 K/V, positional. Full layers keep every position; sliding layers a ring of
+// Q_RING positions (slot = position % Q_RING).
 typedef struct {
-    float *S;                // [Q_N_MAMBA][NH][HD][DS] SSM states
-    float *conv;             // [Q_N_MAMBA][3][Q_MB_CONV] last 3 conv inputs (oldest first)
-    uint16_t *k, *v;         // [Q_N_ATTN + 1][ctx][Q_KV] f16 (the last one is the MTP layer's)
+    uint16_t *kf, *vf;       // [Q_N_FULL][ctx][Q_KV]
+    uint16_t *ks, *vs;       // [Q_N_LAYER - Q_N_FULL][Q_RING][Q_KV]
 } q_state;
 
-#define Q_MAX_T 2048          // tokens per forward call (prefill chunk)
+#define Q_MAX_T 2048         // tokens per forward call (prefill chunk)
 
 struct inz_engine {
     inz_opts opt;
@@ -82,40 +80,36 @@ struct inz_engine {
     uint64_t embed_offset;
     uint8_t *embed_hdr;
     lin head;
-    // experts
-    ec_cache *ec;
-    bool ec_all_resident;
-    int n_moe;               // MoE blocks of the (possibly truncated) model
-    int32_t pred[Q_N_MOE + 1][Q_TOPK];  // lookahead: experts predicted for each MoE block at the previous one
-    bool pred_valid[Q_N_MOE + 1];
-    int expert_type;
-    uint64_t blob_bytes, up_bytes;
+    // experts: two blob classes, each with its own cache
+    q_xclass xc[2];
+    int n_xc;
+    int n_moe;               // MoE layers of the (possibly truncated) model
+    int32_t pred[Q_N_LAYER][Q_TOPK];  // lookahead: experts predicted for each layer at the previous one
+    bool pred_valid[Q_N_LAYER];
     // sequence state
     int ctx;
     q_state st;
     int n_past;
     int32_t *hist;
-    q_state ck;              // recurrent state checkpoint (S, conv) taken at position ck_pos
-    int ck_pos;              // -1: none
-    float *ck_x;             // the final residual of position ck_pos - 1 (MTP input), H
-    q_state snap[Q_SPEC_MAX];  // recurrent state after token t of a verify batch, for t < snap_n
-    int snap_n;
-    float *x_last;           // final residual (after the last block) of position n_past - 1, H
-    int mtp_valid;           // MTP cache slots [0, mtp_valid) are filled
-    uint64_t state_bytes;    // attention cache + recurrent state, for the memory report
+    int ck_pos;              // checkpoint: a position the caches can rewind to (-1: none)
+    float *ck_x;             // unused (no MTP)
+    int snap_n;              // unused (no recurrent state)
+    float *x_last;           // final residual of position n_past - 1, H
+    int mtp_valid;
+    uint64_t state_bytes;    // attention caches, for the memory report
     // scratch for one forward call
     float *X, *Xn, *y, *tmp, *tmp2, *big;
-    float *X2;               // MTP output hidden [Q_MAX_T][H] (input of a chained draft step)
-    float *Xm;               // MTP input rows [Q_MAX_T][H]
-    float *xlat, *moe_lat;   // MoE latent input [T][LAT], weighted latent outputs [T][TOPK][LAT]
-    float *ex_x, *ex_up, *ex_d;  // routed expert batch
+    float *X2;               // final-norm rows for the head
+    float *Xm;
+    float *ex_x, *ex_gu, *ex_d;  // routed expert batch
+    float *moe_out;          // [T][TOPK][H] weighted expert outputs, summed in rank order
     void *eb_items;          // decode expert batch (model_fwd.c)
-    float *eb_up, *eb_d;
+    float *eb_gu, *eb_d;
     inz_act *eb_acts, *eb_xa;
-    float *mb_dt;            // [Q_MAX_T][NH] Mamba step sizes
     void *units;             // [Q_N_EXPERT] tokens routed to each expert (model_fwd.c)
-    inz_act *acts;           // [Q_MAX_T] activation scratch (up to Q_MB_INNER wide)
+    inz_act *acts;           // [Q_MAX_T] activation scratch (up to the widest quantized input)
     float **att_scr;         // per-thread attention scratch
+    float rope_full[Q_ROPE_FULL_DIM / 2], rope_swa[Q_HD / 2];  // inverse frequencies
     // prefill GEMM scratch
     uint8_t **gemm_tb;
     float **gemm_tmp;
@@ -124,9 +118,9 @@ struct inz_engine {
     const char *imx_path;
     imx_entry *imx;
     int n_imx, cap_imx;
-    double *imx_exp;         // [MoE blocks + MTP][512][LAT + FF]: experts' up and down inputs
-    uint64_t *imx_exp_n;     // [MoE blocks + MTP][512]
-    int imx_layer;           // expert cache layer of the MoE block running
+    double *imx_exp;         // [MoE layers][256][H + FF]: experts' gate|up and down inputs
+    uint64_t *imx_exp_n;     // [MoE layers][256]
+    int imx_layer;           // MoE index of the block running
     const char *state;
     double t_loaded;
     char model_name[64];
@@ -144,9 +138,10 @@ int q_imx_register(inz_engine *e, const char *name, int cols);
 void q_imx_write(inz_engine *e);
 // LM head on rows of hidden states that are already normalized
 void q_head(inz_engine *e, const float *Hn, int n, const int *logits_rows, int n_logits, float *out_logits);
-// MTP slots p0 .. p0+n-1: rows of H (main residuals when `residual`, else hidden states of a previous MTP step) with
-// the tokens that follow them. Leaves the MTP output hidden states in e->X2.
+// MTP hook (Laguna has no MTP head: never called)
 void q_mtp_forward(inz_engine *e, const float *H, int ldh, bool residual, const int32_t *next, int n, int p0,
                    const int *logits_rows, int n_logits, float *out_logits);
+// the YaRN / default RoPE inverse frequencies, computed as transformers does (float32)
+void q_rope_init(inz_engine *e);
 
 #endif

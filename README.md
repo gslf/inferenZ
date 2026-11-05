@@ -1,20 +1,19 @@
 # inferenZ
 
-**A single-model inference engine in C for NVIDIA Nemotron 3.5 Super (120B parameters, 12B active), running on CPU with experts streamed from the SSD.**
+**A single-model inference engine in C for Poolside Laguna S 2.1 (118B parameters, 8.5B active), running on CPU with experts streamed from the SSD.**
 
 Linux only. CPU only for now.
 
-Nemotron 3.5 Super is a hybrid model:
-- 88 blocks: 40 Mamba-2 (a recurrent memory of fixed size), 8 attention, 40 mixture-of-experts;
-- a LatentMoE: 512 experts per block, 22 chosen per token, working in a 1024-wide latent space;
-- an MTP head for speculative decoding.
+Laguna S 2.1 is a mixture-of-experts coding model:
+- 48 layers: 12 with global attention (YaRN RoPE, up to 1M tokens), 36 with a 512-token sliding window;
+- 256 experts per layer (top-10) plus a shared expert, from layer 1 on.
 
-inferenZ runs the official NVFP4 release exactly as published: no weight is re-quantized.
+inferenZ runs the official NVFP4 release: its 4-bit experts exactly as published, the rest at 8 bits.
 
 
 ## Quick start
 
-Requirements: Linux on x86-64 with AVX2 and AVX-VNNI, about 64 GB of RAM, gcc ≥ 15, liburing and OpenMP. The model must already be converted: see [Get the model and convert it](#get-the-model-and-convert-it) (the default file is `models/nemotron-3.5-super.inz.gguf`).
+Requirements: Linux on x86-64 with AVX2 and AVX-VNNI, about 64 GB of RAM, gcc ≥ 15, liburing and OpenMP. The model must already be converted: see [Get the model and convert it](#get-the-model-and-convert-it) (the default file is `models/laguna-s-2.1.inz.gguf`).
 
 ```sh
 make
@@ -29,13 +28,13 @@ Open <http://127.0.0.1:8080> once the server prints `serving on http://127.0.0.1
 
 ### The web UI
 
-- **Thinking**: *on* (the model's default) thinks before answering; *efficient* asks the model for shorter reasoning; *off* answers directly.
-- **Monitor** shows live speed, expert-cache hit rate, MTP acceptance and where each token's time goes.
+- **Thinking**: *on* (the model's default) thinks before answering; *off* answers directly.
+- **Monitor** shows live speed, expert-cache hit rate and where each token's time goes.
 
 ### The terminal
 
 ```sh
-./inz run --effort medium
+./inz run --effort none
 ```
 
 Type a message and press Enter; `/quit` exits.
@@ -46,12 +45,12 @@ The same server is an OpenAI-compatible API at `http://127.0.0.1:8080/v1` (any A
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Ciao!"}],"reasoning_effort":"medium"}'
+  -d '{"messages":[{"role":"user","content":"Ciao!"}],"reasoning_effort":"none"}'
 ```
 
 ### Speed on the reference laptop
 
-Core Ultra 7 265U, 62 GB, warm expert cache: 3.95 tok/s plain, 4.71 tok/s with MTP, prefill 16.5 tok/s on a 3.8k-token prompt. Qwen3.8-Flash-Next on `main` is about twice as fast ([comparison](docs/COMPARISON.md)).
+See [the comparison](docs/COMPARISON.md) with Qwen3.8-Flash-Next (`main`) and Nemotron 3.5 Super (`nemotron-3.5`).
 
 ### Memory
 
@@ -64,28 +63,28 @@ The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM
 
 ## References
 
-- **Nemotron 3.5 Super vs Qwen3.8-Flash-Next** (the `main` branch): speed, accuracy and coding quality on the same laptop. [docs/COMPARISON.md](docs/COMPARISON.md)
+- **Laguna S 2.1 vs Qwen3.8-Flash-Next and Nemotron 3.5 Super** (the `main` and `nemotron-3.5` branches): speed, accuracy and coding quality on the same laptop. [docs/COMPARISON.md](docs/COMPARISON.md)
 - **Architecture overview.** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Diagnostics.** [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)
 - **OpenAI-compatible API**: chat (reasoning, tools, streaming), completions. [docs/API.md](docs/API.md)
 - **The model.** [How it works](docs/MODEL.md).
-- **Precision and speed.** [Weight formats](docs/QUANTIZATION.md): NVFP4 and FP8 kept exactly.
+- **Precision and speed.** [Weight formats](docs/QUANTIZATION.md): NVFP4 experts kept exactly, the rest at 8 bits.
 - **SSD expert streaming.** One 4 KiB-aligned blob per expert, `io_uring` + `O_DIRECT`, an LRFU cache, router lookahead prefetch, and missing experts computed in arrival order. [docs/STREAMING.md](docs/STREAMING.md)
-- **MTP speculative decoding** with exact speculative sampling. The 168 MB recurrent state is snapshotted during verification, so a rejected draft costs a copy. [docs/SPECULATIVE.md](docs/SPECULATIVE.md)
+- **No speculative decoding**: Laguna has no MTP head and its drafter is a separate model. [docs/SPECULATIVE.md](docs/SPECULATIVE.md)
 
 
 
 ## Get the model and convert it
 
-`tools/hfget.py` downloads the official NVFP4 checkpoint (73 GB without the vision encoder) in priority order: dense weights first, then the experts block by block. It resumes after interruptions. The converter can start while the download is still running.
+`tools/hfget.py` downloads the official NVFP4 checkpoint (100 GB) in priority order: dense weights first, then the experts layer by layer. It resumes after interruptions. The converter can start while the download is still running.
 
 ```sh
 mkdir -p models && chattr +C models          # btrfs: no CoW/compression, so O_DIRECT works
-python3 -I tools/hfget.py nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 models/Nemotron-3.5-Super-VL-NVFP4 --skip-vision
-./inz convert --src models/Nemotron-3.5-Super-VL-NVFP4 --out models/nemotron-3.5-super.inz.gguf
+python3 -I tools/hfget.py poolside/Laguna-S-2.1-NVFP4 models/Laguna-S-2.1-NVFP4 --ipv4
+./inz convert --src models/Laguna-S-2.1-NVFP4 --out models/laguna-s-2.1.inz.gguf
 ```
 
-The conversion copies every tensor exactly (NVFP4 → Q4N, FP8 → F8T, BF16 → F16) into a 73 GB file.
+The conversion repacks the NVFP4 experts exactly and stores the rest at 8 bits (router and embeddings F16) in a 77 GB file. `--attn F16 --dense F16 --shared F16 --head F16` keeps the BF16 tensors exact, at about twice their bytes per token.
 
 
 

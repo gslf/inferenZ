@@ -1,4 +1,4 @@
-# Compare the C chat template (tests/test_chat) with the official Jinja template of Nemotron 3.5 Super,
+# Compare the C chat template (tests/test_chat) with the official Jinja template of Laguna S 2.1,
 # rendered the way transformers does (sandboxed Jinja, trim_blocks, lstrip_blocks, Python-style tojson).
 import json, subprocess, sys
 import jinja2, jinja2.ext
@@ -7,7 +7,20 @@ tpl_path, exe = sys.argv[1], sys.argv[2]
 def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
     return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 def raise_exception(m): raise RuntimeError(m)
-env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols])
+class Generation(jinja2.ext.Extension):
+    """transformers' {% generation %} block (it marks assistant tokens for training masks): renders its body."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+        return jinja2.nodes.CallBlock(self.call_method("_render"), [], [], body).set_lineno(lineno)
+
+    def _render(self, caller):
+        return caller()
+
+
+env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols, Generation])
 env.filters["tojson"] = tojson
 env.globals["raise_exception"] = raise_exception
 tpl = env.from_string(open(tpl_path).read())
@@ -26,7 +39,7 @@ cases = [
   {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "answer one", "reasoning_content": "\nhmm\n"},
                 {"role": "user", "content": "q2"}]},
   {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "plain"},
-                {"role": "user", "content": [{"type": "text", "text": "multi"}, {"type": "text", "text": " part"}]}]},
+                {"role": "user", "content": "multi part"}]},
   {"messages": [{"role": "system", "content": "You are a C expert."}, {"role": "user", "content": "Write and test hello"},
                 {"role": "assistant", "content": "I will run it.", "reasoning_content": "plan", "tool_calls": [
                     {"id": "c1", "type": "function", "function": {"name": "run_c", "arguments": {"source": code, "args": ["-v", "x y"], "timeout": 2.5}}}]},
@@ -51,6 +64,9 @@ cases = [
                   "n": {"type": "integer", "minimum": 0, "nullable": True},
                   "tags": {"type": "array", "items": {"type": "string"}}}, "required": ["kind"]}}},
              {"name": "bare", "parameters": {}}]},
+  {"messages": [{"role": "system", "content": ""}, {"role": "user", "content": "no system block"}], "effort": "none"},
+  {"messages": [{"role": "system", "content": "  sys with spaces \n"}, {"role": "user", "content": "u"}, {"role": "system", "content": "later"},
+                {"role": "assistant", "content": "a", "reasoning": "r1"}, {"role": "user", "content": "u2"}], "tools": [run_js]},
   {"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": "  spaced  "}, {"role": "user", "content": "y"},
                 {"role": "assistant", "content": "", "reasoning_content": "  "}], "effort": "none", "add_generation_prompt": False},
 ]
@@ -65,7 +81,6 @@ for i, c in enumerate(cases):
     kw = dict(messages=msgs, tools=c.get("tools"), add_generation_prompt=c.get("add_generation_prompt", True))
     eff = c.get("effort")
     if eff == "none": kw["enable_thinking"] = False
-    elif eff in ("low", "medium"): kw["medium_effort"] = True
     ref = tpl.render(**kw)
     mine = out[i].decode()
     if ref == mine: ok += 1

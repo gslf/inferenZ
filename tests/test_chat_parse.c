@@ -38,22 +38,23 @@ int main(void) {
     run("think + answer", "Let me think.\nOK\n</think>\n\nThe answer is 42.", true, NULL, "Let me think.\nOK", "The answer is 42.", NULL);
     run("no thinking", "Direct answer.\n\nSecond paragraph.", false, NULL, "", "Direct answer.\n\nSecond paragraph.", NULL);
     run("tool call with C source",
-        "plan\n</think>\n\nI'll compile it.\n\n<tool_call>\n<function=run_c>\n<parameter=source>\n#include <stdio.h>\n"
-        "int main(void) { puts(\"hi\\n\"); return 0; }\n</parameter>\n<parameter=timeout>\n2.5\n</parameter>\n"
-        "<parameter=args>\n[\"-O2\", \"x\"]\n</parameter>\n</function>\n</tool_call>",
+        "plan</think>I'll compile it.<tool_call>run_c<arg_key>source</arg_key><arg_value>#include <stdio.h>\n"
+        "int main(void) { puts(\"hi\\n\"); return 0; }\n</arg_value><arg_key>timeout</arg_key><arg_value>2.5</arg_value>"
+        "<arg_key>args</arg_key><arg_value>[\"-O2\", \"x\"]</arg_value></tool_call>",
         true, tools, "plan", "I'll compile it.",
         "\"arguments\": \"{\\\"source\\\": \\\"#include <stdio.h>\\\\nint main(void) { puts(\\\\\\\"hi\\\\\\\\n\\\\\\\"); return 0; }\\\", "
         "\\\"timeout\\\": 2.5, \\\"args\\\": [\\\"-O2\\\", \\\"x\\\"]}\"");
     run("string param that looks numeric",
-        "x\n</think>\n\n<tool_call>\n<function=run_c>\n<parameter=source>\n123\n</parameter>\n</function>\n</tool_call>",
+        "x</think><tool_call>run_c<arg_key>source</arg_key><arg_value>123</arg_value></tool_call>",
         true, tools, "x", "", "\\\"source\\\": \\\"123\\\"");
     run("two tool calls",
-        "</think>\n\n<tool_call>\n<function=run_c>\n<parameter=source>\na\n</parameter>\n</function>\n</tool_call>\n"
-        "<tool_call>\n<function=run_c>\n<parameter=source>\nb\n</parameter>\n</function>\n</tool_call>",
+        "</think><tool_call>run_c<arg_key>source</arg_key><arg_value>a</arg_value></tool_call>"
+        "<tool_call>run_c<arg_key>source</arg_key><arg_value>b</arg_value></tool_call>",
         true, tools, "", "", "\"index\": 1");
     run("unknown tool, json value",
-        "</think>\n\n<tool_call>\n<function=other>\n<parameter=n>\n7\n</parameter>\n<parameter=s>\nhello\n</parameter>\n</function>\n</tool_call>",
+        "</think><tool_call>other<arg_key>n</arg_key><arg_value>7</arg_value><arg_key>s</arg_key><arg_value>hello</arg_value></tool_call>",
         true, tools, "", "", "{\\\"n\\\": 7, \\\"s\\\": \\\"hello\\\"}");
+    run("tool call without arguments", "</think><tool_call>ping</tool_call>", true, tools, "", "", "\"name\": \"ping\", \"arguments\": \"{}\"");
     run("newlines inside reasoning", "a\n\nb\n</think>\nc", true, NULL, "a\n\nb", "c", NULL);
     printf("%s\n", fails ? "FAILURES" : "all parser tests passed");
     return fails != 0;

@@ -1,8 +1,8 @@
-// Forward pass of Nemotron 3.5 Super (docs/MODEL.md gives the math; every block below follows it line by line).
+// Forward pass of Laguna S 2.1 (docs/MODEL.md gives the math; every block below follows it line by line).
 //
 // One code path serves decode (n = 1) and prefill chunks (n <= Q_MAX_T). Weights are `lin` matrices in any
-// storage type; activations stay f32 between operators. The Mamba-2 recurrence and its short convolution advance
-// token by token; projections, attention and experts are batched over the chunk.
+// storage type; activations stay f32 between operators. Projections, attention and experts are batched over the
+// chunk.
 #define _GNU_SOURCE
 #include <immintrin.h>
 #include <math.h>
@@ -42,14 +42,8 @@ static inline float siluf(float x) { return x / (1.0f + expf(-x)); }
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 static inline float softplusf(float x) { return x > 20.0f ? x : log1pf(expf(x)); }  // torch threshold 20
 
-static void relu2(float *x, int n) {  // relu(x)^2 in place
-    const __m256 z = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const __m256 v = _mm256_max_ps(_mm256_loadu_ps(x + i), z);
-        _mm256_storeu_ps(x + i, _mm256_mul_ps(v, v));
-    }
-    for (; i < n; i++) x[i] = x[i] > 0 ? x[i] * x[i] : 0;
+static void swiglu(float *gu, int ff) {  // gu = [gate | up] -> silu(gate) * up in the first ff values
+    for (int c = 0; c < ff; c++) gu[c] = siluf(gu[c]) * gu[ff + c];
 }
 
 static void f32_to_f16(uint16_t *dst, const float *src, int n) {
@@ -173,13 +167,13 @@ static void imx_add(double *acc, const float *X, int ldx, int n, int cols) {
 void q_imx_write(inz_engine *e) {
     FILE *f = fopen(e->imx_path, "wb");
     if (!f) { LOGI("imatrix: cannot write %s", e->imx_path); return; }
-    const int nl = e->n_moe + (e->mtp.present ? 1 : 0);
+    const int nl = e->n_moe;
     uint32_t count = 0;
     for (int i = 0; i < e->n_imx; i++) count += e->imx[i].n > 0;
     for (int k = 0; k < nl * Q_N_EXPERT; k++) count += 2 * (e->imx_exp_n[k] > 0);
     fwrite("INZIMX01", 1, 8, f);
     fwrite(&count, 4, 1, f);
-    float *buf = inz_malloc(sizeof(float) * 2 * Q_H);
+    float *buf = inz_malloc(sizeof(float) * Q_DENSE_FF);
     for (int i = 0; i < e->n_imx; i++) {
         const imx_entry *x = &e->imx[i];
         if (!x->n) continue;
@@ -192,14 +186,13 @@ void q_imx_write(inz_engine *e) {
     for (int k = 0; k < nl * Q_N_EXPERT; k++) {
         if (!e->imx_exp_n[k]) continue;
         const int l = k / Q_N_EXPERT, xid = k % Q_N_EXPERT;
-        const double *acc = e->imx_exp + (size_t)k * (Q_LAT + Q_FF);
+        const double *acc = e->imx_exp + (size_t)k * (Q_H + Q_FF);
         for (int part = 0; part < 2; part++) {
             char name[48];
-            if (l < e->n_moe) snprintf(name, sizeof(name), "moe.%d.experts.%d.%s", l, xid, part ? "down" : "up");
-            else snprintf(name, sizeof(name), "mtp.experts.%d.%s", xid, part ? "down" : "up");
+            snprintf(name, sizeof(name), "blk.%d.experts.%d.%s", l + 1, xid, part ? "down" : "gate_up");
             const uint16_t len = (uint16_t)strlen(name);
-            const uint32_t cols = part ? Q_FF : Q_LAT;
-            for (uint32_t c = 0; c < cols; c++) buf[c] = (float)(acc[(part ? Q_LAT : 0) + c] / (double)e->imx_exp_n[k]);
+            const uint32_t cols = part ? Q_FF : Q_H;
+            for (uint32_t c = 0; c < cols; c++) buf[c] = (float)(acc[(part ? Q_H : 0) + c] / (double)e->imx_exp_n[k]);
             fwrite(&len, 2, 1, f); fwrite(name, 1, len, f); fwrite(&cols, 4, 1, f); fwrite(&e->imx_exp_n[k], 8, 1, f);
             fwrite(buf, 4, cols, f);
         }
@@ -299,219 +292,199 @@ static void add_rows(float *X, const float *y, int n) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Mamba-2                                                             */
+/* RoPE                                                                */
 /* ------------------------------------------------------------------ */
 
-#define MB_CCHUNK 512
-typedef struct {
-    inz_engine *e;
-    const q_layer *L;
-    int n;
-    const float *P;      // [n][Q_MB_PROJ] in_proj output: z | x B C | dt
-    float *cv;           // [n][Q_MB_CONV] conv + silu: x | B | C
-    float *dt;           // [n][NH] step sizes
-    float *yo;           // [n][INNER] scan output, then gated-normalized in place
-} mb_job;
-
-// causal depthwise conv (kernel 4, bias) over x | B | C and silu; step sizes dt = softplus(dt_raw + dt_bias). Tokens
-// are independent here: the conv reads raw inputs, from the chunk or from the saved state.
-static void mb_conv_task(void *ctx, int64_t b, int64_t e_, int tid) {
-    (void)tid;
-    mb_job *j = ctx;
-    const q_layer *L = j->L;
-    const float *cs = j->e->st.conv + (size_t)L->idx * (Q_MB_KS - 1) * Q_MB_CONV;  // last 3 inputs, oldest first
-    const int nch = Q_MB_CONV / MB_CCHUNK;
-    for (int64_t item = b; item < e_; item++) {
-        const int t = (int)(item / nch), c0 = (int)(item % nch) * MB_CCHUNK;
-        const float *tap[4];
-        for (int k = 0; k < 3; k++) {
-            const int d = 3 - k;
-            tap[k] = t >= d ? j->P + (size_t)(t - d) * Q_MB_PROJ + Q_MB_INNER : cs + (size_t)(3 - d + t) * Q_MB_CONV;
-        }
-        tap[3] = j->P + (size_t)t * Q_MB_PROJ + Q_MB_INNER;
-        float *cv = j->cv + (size_t)t * Q_MB_CONV;
-        for (int c = c0; c < c0 + MB_CCHUNK; c++) {
-            const float *w = L->mb_conv + (size_t)c * Q_MB_KS;
-            cv[c] = siluf(L->mb_conv_b[c] + w[0] * tap[0][c] + w[1] * tap[1][c] + w[2] * tap[2][c] + w[3] * tap[3][c]);
-        }
-        if (c0 == 0) {
-            const float *dr = j->P + (size_t)t * Q_MB_PROJ + Q_MB_INNER + Q_MB_CONV;
-            for (int h = 0; h < Q_MB_NH; h++) j->dt[t * Q_MB_NH + h] = softplusf(dr[h] + L->mb_dt[h]);
-        }
+// Inverse frequencies as transformers computes them (float32): plain RoPE for the sliding layers, YaRN for the full
+// ones (factor 128 over 8192 positions, beta_fast 32 / beta_slow 1, truncated correction range).
+void q_rope_init(inz_engine *e) {
+    for (int i = 0; i < Q_HD / 2; i++) e->rope_swa[i] = 1.0f / powf((float)Q_ROPE_SWA_THETA, (float)(2 * i) / (float)Q_HD);
+    const int dim = Q_ROPE_FULL_DIM;
+    const double lb = log(Q_ROPE_FULL_THETA);
+#define CORR_DIM(rot) ((dim * log(Q_ROPE_FULL_ORIG / ((rot) * 2 * M_PI))) / (2 * lb))
+    double low = floor(CORR_DIM(32.0)), high = ceil(CORR_DIM(1.0));
+#undef CORR_DIM
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = dim - 1;
+    if (low == high) high += 0.001;
+    for (int i = 0; i < dim / 2; i++) {
+        const float pos = powf((float)Q_ROPE_FULL_THETA, (float)(2 * i) / (float)dim);
+        const float extra = 1.0f / pos, inter = 1.0f / ((float)Q_ROPE_FULL_FACTOR * pos);
+        float ramp = (float)(((double)i - low) / (high - low));
+        ramp = ramp < 0 ? 0 : ramp > 1 ? 1 : ramp;
+        const float ef = 1.0f - ramp;
+        e->rope_full[i] = inter * (1.0f - ef) + extra * ef;
     }
 }
 
-// one head through all n tokens: S = S * exp(dt A) + dt x B^T; y = S C + D x. B and C are shared by the 16 heads of
-// a group. The head's 32 KB state stays in L1/L2 for the whole chunk.
-static void mb_scan_task(void *ctx, int64_t b, int64_t e_, int tid) {
-    (void)tid;
-    mb_job *j = ctx;
-    inz_engine *e = j->e;
-    const q_layer *L = j->L;
-    const size_t hs = (size_t)Q_MB_HD * Q_MB_DS;
-    for (int64_t h = b; h < e_; h++) {
-        float *S = e->st.S + ((size_t)L->idx * Q_MB_NH + h) * hs;
-        const int g = (int)h / (Q_MB_NH / Q_MB_NG);
-        for (int t = 0; t < j->n; t++) {
-            const float *cv = j->cv + (size_t)t * Q_MB_CONV;
-            const float *x = cv + h * Q_MB_HD, *B = cv + Q_MB_INNER + g * Q_MB_DS, *C = cv + Q_MB_INNER + Q_MB_NG * Q_MB_DS + g * Q_MB_DS;
-            const float dt = j->dt[t * Q_MB_NH + h];
-            const __m256 dA = _mm256_set1_ps(expf(dt * L->mb_negA[h]));
-            float *y = j->yo + (size_t)t * Q_MB_INNER + h * Q_MB_HD;
-            for (int p = 0; p < Q_MB_HD; p++) {
-                float *Sp = S + (size_t)p * Q_MB_DS;
-                const __m256 dx = _mm256_set1_ps(dt * x[p]);
-                __m256 acc = _mm256_setzero_ps();
-                for (int s = 0; s < Q_MB_DS; s += 8) {
-                    const __m256 sv = _mm256_fmadd_ps(dx, _mm256_loadu_ps(B + s), _mm256_mul_ps(_mm256_loadu_ps(Sp + s), dA));
-                    _mm256_storeu_ps(Sp + s, sv);
-                    acc = _mm256_fmadd_ps(sv, _mm256_loadu_ps(C + s), acc);
-                }
-                y[p] = hsum256_ps(acc) + L->mb_D[h] * x[p];
-            }
-            if (t < e->snap_n)                  // speculative verify: this head's state after draft position t
-                memcpy(e->snap[t].S + ((size_t)L->idx * Q_MB_NH + h) * hs, S, sizeof(float) * hs);
-        }
+// NeoX halves on the first `rd` dims of a head (pairs i, i + rd/2), cos and sin scaled by `scale`
+static void rope(float *x, int pos, const float *inv, int rd, float scale) {
+    const int half = rd / 2;
+    for (int i = 0; i < half; i++) {
+        const float a = (float)pos * inv[i];
+        const float c = cosf(a) * scale, s = sinf(a) * scale;
+        const float x1 = x[i], x2 = x[i + half];
+        x[i] = x1 * c - x2 * s;
+        x[i + half] = x2 * c + x1 * s;
     }
-}
-
-// gated RMSNorm per group of 1024: y = rmsnorm(y * silu(z)) * w, in place
-static void mb_norm_task(void *ctx, int64_t b, int64_t e_, int tid) {
-    (void)tid;
-    mb_job *j = ctx;
-    for (int64_t item = b; item < e_; item++) {
-        const int t = (int)(item / Q_MB_NG), g = (int)(item % Q_MB_NG);
-        float *y = j->yo + (size_t)t * Q_MB_INNER + g * Q_MB_NORM_GROUP;
-        const float *z = j->P + (size_t)t * Q_MB_PROJ + g * Q_MB_NORM_GROUP;
-        for (int i = 0; i < Q_MB_NORM_GROUP; i++) y[i] *= siluf(z[i]);
-        rmsnorm(y, y, j->L->mb_norm + g * Q_MB_NORM_GROUP, Q_MB_NORM_GROUP);
-    }
-}
-
-static void mamba_block(inz_engine *e, const q_layer *L, int n, const float *xin, float *y) {
-    float *P = e->big, *cv = e->tmp, *yo = e->tmp2;  // [n][18560], [n][10240], [n][8192]
-    lin_mm(e, &L->mb_in, xin, Q_H, n, P, Q_MB_PROJ);
-    mb_job j = {e, L, n, P, cv, e->mb_dt, yo};
-    tp_for(e->tp, (int64_t)n * (Q_MB_CONV / MB_CCHUNK), 1, mb_conv_task, &j);
-    tp_for(e->tp, Q_MB_NH, 1, mb_scan_task, &j);
-    tp_for(e->tp, (int64_t)n * Q_MB_NG, 2, mb_norm_task, &j);
-    // conv state: the last 3 raw inputs (part of the old state when the chunk is short); speculative snapshots
-    // take the state after each draft position
-    float *cs = e->st.conv + (size_t)L->idx * (Q_MB_KS - 1) * Q_MB_CONV;
-    const size_t cz = (size_t)(Q_MB_KS - 1) * Q_MB_CONV;
-    for (int s = 0; s < e->snap_n && s < n; s++)
-        for (int i = 0; i < 3; i++) {
-            const int src = s + 1 - 3 + i;
-            memcpy(e->snap[s].conv + (size_t)L->idx * cz + (size_t)i * Q_MB_CONV,
-                   src >= 0 ? P + (size_t)src * Q_MB_PROJ + Q_MB_INNER : cs + (size_t)(i + s + 1) * Q_MB_CONV, sizeof(float) * Q_MB_CONV);
-        }
-    for (int i = 0; i < 3; i++) {
-        const int src = n - 3 + i;
-        if (src >= 0) memcpy(cs + (size_t)i * Q_MB_CONV, P + (size_t)src * Q_MB_PROJ + Q_MB_INNER, sizeof(float) * Q_MB_CONV);
-        else memmove(cs + (size_t)i * Q_MB_CONV, cs + (size_t)(i + n) * Q_MB_CONV, sizeof(float) * Q_MB_CONV);
-    }
-    lin_mm(e, &L->mb_out, yo, Q_MB_INNER, n, y, Q_H);
 }
 
 /* ------------------------------------------------------------------ */
 /* Attention                                                           */
 /* ------------------------------------------------------------------ */
 
-typedef struct { inz_engine *e; int ai, n, p0; const float *q; float *out; } att_job;
+typedef struct { inz_engine *e; int l, n, p0, nh; const float *q, *g; float *out; } att_job;
 
-// one (token, head) pair: softmax(q k^T / sqrt(128)) v over positions 0..p (causal, no positional encoding)
+// K/V rows of one layer: full layers by position, sliding layers in a ring
+static inline const uint16_t *kv_row(const inz_engine *e, const uint16_t *base, int l, int pos) {
+    return base + (size_t)(q_is_full(l) ? pos : pos % Q_RING) * Q_KV;
+}
+
+static void kv_bases(const inz_engine *e, int l, uint16_t **K, uint16_t **V) {
+    if (q_is_full(l)) {
+        const size_t off = (size_t)(l / 4) * e->ctx * Q_KV;
+        *K = e->st.kf + off;
+        *V = e->st.vf + off;
+    } else {
+        const size_t off = (size_t)(l - l / 4 - 1) * Q_RING * Q_KV;
+        *K = e->st.ks + off;
+        *V = e->st.vs + off;
+    }
+}
+
+// one (token, head) pair: softmax(q k^T / sqrt(128)) v over the visible positions, times softplus(g)
 static void att_head_task(void *ctx, int64_t b, int64_t e_, int tid) {
     att_job *j = ctx;
     inz_engine *e = j->e;
-    const uint16_t *K = e->st.k + (size_t)j->ai * e->ctx * Q_KV, *V = e->st.v + (size_t)j->ai * e->ctx * Q_KV;
+    uint16_t *K, *V;
+    kv_bases(e, j->l, &K, &V);
     float *sc = e->att_scr[tid];
     const float scale = 1.0f / sqrtf((float)Q_HD);
+    const int rep = j->nh / Q_NKV;
     for (int64_t th = b; th < e_; th++) {
-        const int t = (int)(th / Q_NH), h = (int)(th % Q_NH), g = h / (Q_NH / Q_NKV), np = j->p0 + t + 1;
-        const float *qh = j->q + (size_t)t * Q_QD + h * Q_HD;
-        for (int i = 0; i < np; i++) sc[i] = dot_f16(K + (size_t)i * Q_KV + g * Q_HD, qh, Q_HD) * scale;
+        const int t = (int)(th / j->nh), h = (int)(th % j->nh), kh = h / rep, p = j->p0 + t;
+        const int first = q_is_full(j->l) || p < Q_WINDOW ? 0 : p - Q_WINDOW + 1, np = p - first + 1;
+        const float *qh = j->q + ((size_t)t * j->nh + h) * Q_HD;
+        for (int i = 0; i < np; i++) sc[i] = dot_f16(kv_row(e, K, j->l, first + i) + kh * Q_HD, qh, Q_HD) * scale;
         softmax_inplace(sc, np);
         float o[Q_HD] = {0};
-        for (int i = 0; i < np; i++) axpy_f16(o, sc[i], V + (size_t)i * Q_KV + g * Q_HD, Q_HD);
-        memcpy(j->out + (size_t)t * Q_QD + h * Q_HD, o, sizeof(o));
+        for (int i = 0; i < np; i++) axpy_f16(o, sc[i], kv_row(e, V, j->l, first + i) + kh * Q_HD, Q_HD);
+        const float gt = softplusf(j->g[(size_t)t * j->nh + h]);
+        float *dst = j->out + ((size_t)t * j->nh + h) * Q_HD;
+        for (int d = 0; d < Q_HD; d++) dst[d] = o[d] * gt;
     }
 }
 
-// ai: attention cache index (0..7 for the model's attention blocks, Q_N_ATTN for the MTP layer)
-static void attn_block(inz_engine *e, const q_layer *L, int ai, int n, int p0, const float *xin, float *y) {
-    float *q = e->big, *att = e->big + (size_t)Q_MAX_T * Q_QD;  // [n][4096] each
-    float *k = e->tmp, *v = e->tmp2;                             // [n][256]
-    lin_mm(e, &L->at_q, xin, Q_H, n, q, Q_QD);
-    lin_mm(e, &L->at_k, xin, Q_H, n, k, Q_KV);
-    lin_mm(e, &L->at_v, xin, Q_H, n, v, Q_KV);
-    uint16_t *K = e->st.k + (size_t)ai * e->ctx * Q_KV, *V = e->st.v + (size_t)ai * e->ctx * Q_KV;
+static void attn_block(inz_engine *e, const q_layer *L, int l, int n, int p0, const float *xin, float *y) {
+    const int nh = L->nh, qd = nh * Q_HD;
+    float *q = e->big, *att = e->big + (size_t)Q_MAX_T * Q_QD_MAX;  // [n][nh*128] each
+    float *k = e->tmp, *v = e->tmp + (size_t)Q_MAX_T * Q_KV, *g = e->tmp2;  // [n][1024], [n][1024], [n][nh]
+    lin_mm(e, &L->at_q, xin, Q_H, n, q, qd);
+    lin_mm_after(e, &L->at_k, &L->at_q, xin, Q_H, n, k, Q_KV);
+    lin_mm_after(e, &L->at_v, &L->at_k, xin, Q_H, n, v, Q_KV);
+    lin_mm_after(e, &L->at_g, &L->at_v, xin, Q_H, n, g, nh);
+    const bool full = q_is_full(l);
+    const float *inv = full ? e->rope_full : e->rope_swa;
+    const int rd = full ? Q_ROPE_FULL_DIM : Q_HD;
+    const float rs = full ? Q_ROPE_FULL_ATTN : 1.0f;
+    uint16_t *K, *V;
+    kv_bases(e, l, &K, &V);
     for (int t = 0; t < n; t++) {
-        f32_to_f16(K + (size_t)(p0 + t) * Q_KV, k + (size_t)t * Q_KV, Q_KV);
-        f32_to_f16(V + (size_t)(p0 + t) * Q_KV, v + (size_t)t * Q_KV, Q_KV);
+        const int p = p0 + t;
+        for (int h = 0; h < nh; h++) {
+            float *qh = q + ((size_t)t * nh + h) * Q_HD;
+            rmsnorm(qh, qh, L->q_norm, Q_HD);
+            rope(qh, p, inv, rd, rs);
+        }
+        float kk[Q_KV];
+        for (int kh = 0; kh < Q_NKV; kh++) {
+            rmsnorm(kk + kh * Q_HD, k + (size_t)t * Q_KV + kh * Q_HD, L->k_norm, Q_HD);
+            rope(kk + kh * Q_HD, p, inv, rd, rs);
+        }
+        f32_to_f16((uint16_t *)kv_row(e, K, l, p), kk, Q_KV);
+        f32_to_f16((uint16_t *)kv_row(e, V, l, p), v + (size_t)t * Q_KV, Q_KV);
     }
-    att_job j = {e, ai, n, p0, q, att};
-    tp_for(e->tp, (int64_t)n * Q_NH, 1, att_head_task, &j);
-    lin_mm(e, &L->at_o, att, Q_QD, n, y, Q_H);
+    att_job j = {e, l, n, p0, nh, q, g, att};
+    tp_for(e->tp, (int64_t)n * nh, 1, att_head_task, &j);
+    lin_mm(e, &L->at_o, att, qd, n, y, Q_H);
 }
 
 /* ------------------------------------------------------------------ */
-/* LatentMoE                                                           */
+/* Dense MLP (layer 0)                                                 */
 /* ------------------------------------------------------------------ */
 
-// tokens routed to one expert; slot = t * Q_TOPK + rank, where the expert's weighted latent output for that token goes
+typedef struct { float *gu; int ff, ld; } swiglu_job;
+static void swiglu_task(void *ctx, int64_t b, int64_t e_, int tid) {
+    (void)tid;
+    swiglu_job *j = ctx;
+    for (int64_t t = b; t < e_; t++) swiglu(j->gu + (size_t)t * j->ld, j->ff);
+}
+
+static void dense_block(inz_engine *e, const q_layer *L, int n, const float *xin, float *y) {
+    float *GU = e->big;                         // [n][2 * 12288] (big holds T x 2*9216 floats)
+    lin_mm(e, &L->d_gu, xin, Q_H, n, GU, 2 * Q_DENSE_FF);
+    swiglu_job j = {GU, Q_DENSE_FF, 2 * Q_DENSE_FF};
+    tp_for(e->tp, n, 4, swiglu_task, &j);
+    lin_mm(e, &L->d_down, GU, 2 * Q_DENSE_FF, n, y, Q_H);
+}
+
+/* ------------------------------------------------------------------ */
+/* MoE                                                                 */
+/* ------------------------------------------------------------------ */
+
+// tokens routed to one expert; slot = t * Q_TOPK + rank, where the expert's weighted output for that token goes
 typedef struct { int expert, ntok; int tok[Q_MAX_T]; int slot[Q_MAX_T]; float w[Q_MAX_T]; } unit;
 
-// out[slot] = w * down(relu(up x)^2) for the tokens routed to one expert, in the latent space. The slots are summed
-// in rank order afterwards, so the result does not depend on which experts were resident or in which order reads
-// completed.
-static void expert_compute(inz_engine *e, const uint8_t *blob, const unit *u, const float *xlat, float *out) {
-    lin up, dn;
-    if (!q_bind_lin(&up, e->expert_type, Q_FF, Q_LAT, blob) || !q_bind_lin(&dn, e->expert_type, Q_LAT, Q_FF, blob + e->up_bytes))
+// out[slot] = w * down(silu(gate x) * up x) for the tokens routed to one expert. The slots are summed in rank order
+// afterwards, so the result does not depend on which experts were resident or in which order reads completed.
+static void expert_compute(inz_engine *e, const q_xclass *xc, const uint8_t *blob, const unit *u, const float *xin, float *out) {
+    lin gu, dn;
+    if (!q_bind_lin(&gu, xc->type, 2 * Q_FF, Q_H, blob) || !q_bind_lin(&dn, xc->type, Q_H, Q_FF, blob + xc->gu_bytes))
         inz_die("expert blob is corrupt (expert %d)", u->expert);
-    float *X = e->ex_x, *U = e->ex_up, *D = e->ex_d;
-    for (int i = 0; i < u->ntok; i++) memcpy(X + (size_t)i * Q_LAT, xlat + (size_t)u->tok[i] * Q_LAT, sizeof(float) * Q_LAT);
-    lin_mm(e, &up, X, Q_LAT, u->ntok, U, Q_FF);
-    relu2(U, u->ntok * Q_FF);
-    if (e->imx_exp) {                           // importance matrix: this expert's up and down inputs
+    float *X = e->ex_x, *GU = e->ex_gu, *D = e->ex_d;
+    for (int i = 0; i < u->ntok; i++) memcpy(X + (size_t)i * Q_H, xin + (size_t)u->tok[i] * Q_H, sizeof(float) * Q_H);
+    lin_mm(e, &gu, X, Q_H, u->ntok, GU, 2 * Q_FF);
+    for (int i = 0; i < u->ntok; i++) swiglu(GU + (size_t)i * 2 * Q_FF, Q_FF);
+    if (e->imx_exp) {                           // importance matrix: this expert's gate|up and down inputs
         const size_t k = (size_t)e->imx_layer * Q_N_EXPERT + (size_t)u->expert;
-        double *acc = e->imx_exp + k * (Q_LAT + Q_FF);
-        imx_add(acc, X, Q_LAT, u->ntok, Q_LAT);
-        imx_add(acc + Q_LAT, U, Q_FF, u->ntok, Q_FF);
+        double *acc = e->imx_exp + k * (Q_H + Q_FF);
+        imx_add(acc, X, Q_H, u->ntok, Q_H);
+        imx_add(acc + Q_H, GU, 2 * Q_FF, u->ntok, Q_FF);
         e->imx_exp_n[k] += (uint64_t)u->ntok;
     }
-    lin_mm(e, &dn, U, Q_FF, u->ntok, D, Q_LAT);
+    lin_mm(e, &dn, GU, 2 * Q_FF, u->ntok, D, Q_H);
     for (int i = 0; i < u->ntok; i++) {
-        float *o = out + (size_t)u->slot[i] * Q_LAT;
-        const float w = u->w[i], *dt = D + (size_t)i * Q_LAT;
-        for (int c = 0; c < Q_LAT; c++) o[c] = w * dt[c];
+        float *o = out + (size_t)u->slot[i] * Q_H;
+        const float w = u->w[i], *dt = D + (size_t)i * Q_H;
+        for (int c = 0; c < Q_H; c++) o[c] = w * dt[c];
     }
 }
 
-/* Decode / verify (n <= 8 tokens): the resident experts of a block are computed together, in three dispatches over
+/* Decode / verify (n <= 8 tokens): the resident experts of a layer are computed together, in three dispatches over
  * (expert, 16-row chunk) items, instead of two small dispatches per expert. Per row the arithmetic is the same as
  * expert_compute's, so the results are identical. */
 #define EB_TOK 8
 #define EB_MAX (Q_TOPK * EB_TOK)                 // experts x tokens of one batch
 typedef struct {
     const unit *u;
-    lin up, dn;
-    inz_act ua[EB_TOK], da[EB_TOK];              // per token: the quantized input of up, of down
-    float *U;                                    // [ntok][FF]
-    float *D;                                    // [ntok][LAT]
+    lin gu, dn;
+    inz_act ga[EB_TOK], da[EB_TOK];              // per token: the quantized input of gate|up, of down
+    float *GU;                                   // [ntok][2 FF]
+    float *D;                                    // [ntok][H]
 } ebatch_item;
 
 typedef struct { inz_engine *e; ebatch_item *it; int ni; } ebatch_job;
 
 #define EB_CHUNK 16
-static void eb_up_task(void *ctx, int64_t b, int64_t e_, int tid) {
+static void eb_gu_task(void *ctx, int64_t b, int64_t e_, int tid) {
     (void)tid;
     ebatch_job *j = ctx;
-    const int per = Q_FF / EB_CHUNK;
+    const int per = 2 * Q_FF / EB_CHUNK;
     for (int64_t k = b; k < e_; k++) {
         ebatch_item *it = &j->it[k / per];
         const int r0 = (int)(k % per) * EB_CHUNK, r1 = r0 + EB_CHUNK;
-        if (it->u->ntok == 1) inz_matvec_rows(&it->up.q, it->ua, it->U, r0, r1);
-        else inz_matmul_rows(&it->up.q, it->ua, it->u->ntok, it->U, Q_FF, r0, r1);
+        if (it->u->ntok == 1) inz_matvec_rows(&it->gu.q, it->ga, it->GU, r0, r1);
+        else inz_matmul_rows(&it->gu.q, it->ga, it->u->ntok, it->GU, 2 * Q_FF, r0, r1);
     }
 }
 
@@ -521,8 +494,8 @@ static void eb_act_task(void *ctx, int64_t b, int64_t e_, int tid) {
     for (int64_t k = b; k < e_; k++) {
         ebatch_item *it = &j->it[k];
         for (int i = 0; i < it->u->ntok; i++) {
-            float *r = it->U + (size_t)i * Q_FF;
-            relu2(r, Q_FF);
+            float *r = it->GU + (size_t)i * 2 * Q_FF;
+            swiglu(r, Q_FF);
             inz_act_quantize(&it->da[i], r, Q_FF, it->dn.q.rot_block, it->dn.q.rot_seed);
         }
     }
@@ -531,46 +504,46 @@ static void eb_act_task(void *ctx, int64_t b, int64_t e_, int tid) {
 static void eb_down_task(void *ctx, int64_t b, int64_t e_, int tid) {
     (void)tid;
     ebatch_job *j = ctx;
-    const int per = Q_LAT / EB_CHUNK;
+    const int per = Q_H / EB_CHUNK;
     for (int64_t k = b; k < e_; k++) {
         ebatch_item *it = &j->it[k / per];
         const int r0 = (int)(k % per) * EB_CHUNK, r1 = r0 + EB_CHUNK;
         const unit *u = it->u;
         if (u->ntok == 1) inz_matvec_rows(&it->dn.q, it->da, it->D, r0, r1);
-        else inz_matmul_rows(&it->dn.q, it->da, u->ntok, it->D, Q_LAT, r0, r1);
+        else inz_matmul_rows(&it->dn.q, it->da, u->ntok, it->D, Q_H, r0, r1);
         for (int i = 0; i < u->ntok; i++) {
-            float *o = j->e->moe_lat + (size_t)u->slot[i] * Q_LAT;
-            const float w = u->w[i], *dt = it->D + (size_t)i * Q_LAT;
+            float *o = j->e->moe_out + (size_t)u->slot[i] * Q_H;
+            const float w = u->w[i], *dt = it->D + (size_t)i * Q_H;
             for (int r = r0; r < r1; r++) o[r] = w * dt[r];
         }
     }
 }
 
-// compute the given units (blobs pinned) as one batch; quantized expert types only. The tokens' latent inputs are
-// quantized once for the up rotation, which all experts of a block share; an expert with another rotation (not
-// produced by the converter) is computed on its own.
-static void experts_batch(inz_engine *e, const unit *const *us, const uint8_t *const *blobs, int nb, int n, const float *xlat) {
+// compute the given units (blobs pinned) as one batch; quantized expert types only. The tokens' inputs are quantized
+// once for the gate|up rotation, which all experts of a layer share; an expert with another rotation (not produced by
+// the converter) is computed on its own.
+static void experts_batch(inz_engine *e, const q_xclass *xc, const unit *const *us, const uint8_t *const *blobs, int nb, int n,
+                          const float *xin) {
     ebatch_item *it = e->eb_items;
     int ni = 0, rows = 0, qrot = -1;
     uint32_t qseed = 0;
     for (int i = 0; i < nb; i++) {
         ebatch_item *x = &it[ni];
-        if (!q_bind_lin(&x->up, e->expert_type, Q_FF, Q_LAT, blobs[i]) ||
-            !q_bind_lin(&x->dn, e->expert_type, Q_LAT, Q_FF, blobs[i] + e->up_bytes))
+        if (!q_bind_lin(&x->gu, xc->type, 2 * Q_FF, Q_H, blobs[i]) || !q_bind_lin(&x->dn, xc->type, Q_H, Q_FF, blobs[i] + xc->gu_bytes))
             inz_die("expert blob is corrupt (expert %d)", us[i]->expert);
         if (qrot < 0) {
-            qrot = x->up.q.rot_block;
-            qseed = x->up.q.rot_seed;
-            for (int t = 0; t < n; t++) inz_act_quantize(&e->eb_xa[t], xlat + (size_t)t * Q_LAT, Q_LAT, qrot, qseed);
-        } else if (x->up.q.rot_block != qrot || x->up.q.rot_seed != qseed) {
-            expert_compute(e, blobs[i], us[i], xlat, e->moe_lat);
+            qrot = x->gu.q.rot_block;
+            qseed = x->gu.q.rot_seed;
+            for (int t = 0; t < n; t++) inz_act_quantize(&e->eb_xa[t], xin + (size_t)t * Q_H, Q_H, qrot, qseed);
+        } else if (x->gu.q.rot_block != qrot || x->gu.q.rot_seed != qseed) {
+            expert_compute(e, xc, blobs[i], us[i], xin, e->moe_out);
             continue;
         }
         x->u = us[i];
-        x->U = e->eb_up + (size_t)rows * Q_FF;
-        x->D = e->eb_d + (size_t)rows * Q_LAT;
+        x->GU = e->eb_gu + (size_t)rows * 2 * Q_FF;
+        x->D = e->eb_d + (size_t)rows * Q_H;
         for (int t = 0; t < us[i]->ntok; t++) {
-            x->ua[t] = e->eb_xa[us[i]->tok[t]];
+            x->ga[t] = e->eb_xa[us[i]->tok[t]];
             x->da[t] = e->eb_acts[rows + t];
         }
         rows += us[i]->ntok;
@@ -578,24 +551,28 @@ static void experts_batch(inz_engine *e, const unit *const *us, const uint8_t *c
     }
     if (!ni) return;
     ebatch_job j = {e, it, ni};
-    tp_for(e->tp, (int64_t)ni * (Q_FF / EB_CHUNK), 4, eb_up_task, &j);
+    tp_for(e->tp, (int64_t)ni * (2 * Q_FF / EB_CHUNK), 4, eb_gu_task, &j);
     tp_for(e->tp, ni, 1, eb_act_task, &j);
-    tp_for(e->tp, (int64_t)ni * (Q_LAT / EB_CHUNK), 8, eb_down_task, &j);
+    tp_for(e->tp, (int64_t)ni * (Q_H / EB_CHUNK), 8, eb_down_task, &j);
 }
 
-// the next MoE block after block l (lookahead), or NULL
-static const q_layer *next_moe(const inz_engine *e, int l) {
-    for (int k = l + 1; k < e->n_layer; k++)
-        if (e->L[k].kind == QB_MOE) return &e->L[k];
-    return NULL;
+// top-10 by sigmoid score + selection bias; weights are the chosen scores, normalized and scaled by 2.5
+static void route(const float *lg, const float *bias, int32_t *sel, float *w) {
+    float sc[Q_N_EXPERT], ch[Q_N_EXPERT];
+    for (int x = 0; x < Q_N_EXPERT; x++) { sc[x] = sigmoidf(lg[x]); ch[x] = sc[x] + bias[x]; }
+    topk_f32(ch, Q_N_EXPERT, Q_TOPK, sel);
+    float sum = 0;
+    for (int k = 0; k < Q_TOPK; k++) { w[k] = sc[sel[k]]; sum += w[k]; }
+    for (int k = 0; k < Q_TOPK; k++) w[k] = w[k] / sum * Q_ROUTED_SCALE;
 }
 
-// L->idx: expert cache layer (0..39, n_moe for the MTP layer); dl: block index for diagnostics
-static void moe_block(inz_engine *e, const q_layer *L, int dl, int n, const float *xin, float *y) {
-    const int l = L->idx;
-    const uint64_t io_start = ec_read_bytes(e->ec);
-    e->imx_layer = l;
-    float *logits = e->tmp;                     // [n][512]
+static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float *xin, float *y) {
+    const q_xclass *xc = L->xc;
+    ec_cache *ec = xc->ec;
+    const int xl = L->xl, mi = q_moe_index(l);
+    const uint64_t io_start = ec_read_bytes(ec);
+    e->imx_layer = mi;
+    float *logits = e->tmp;                     // [n][256]
     uint64_t t0 = diag_tsc();
     lin_mm(e, &L->router, xin, Q_H, n, logits, Q_N_EXPERT);
     unit *units = e->units;
@@ -603,22 +580,11 @@ static void moe_block(inz_engine *e, const q_layer *L, int dl, int n, const floa
     for (int x = 0; x < Q_N_EXPERT; x++) uid[x] = -1;
     int nu = 0;
     for (int t = 0; t < n; t++) {
-        // sigmoid scores; the correction bias only shifts the choice; weights are the chosen scores, normalized and
-        // scaled by 5
-        const float *lg = logits + (size_t)t * Q_N_EXPERT;
-        float sc[Q_N_EXPERT], ch[Q_N_EXPERT];
-        for (int x = 0; x < Q_N_EXPERT; x++) { sc[x] = sigmoidf(lg[x]); ch[x] = sc[x] + L->router_bias[x]; }
         int32_t sel[Q_TOPK];
-        float w[Q_TOPK], sum = 0;
-        topk_f32(ch, Q_N_EXPERT, Q_TOPK, sel);
-        for (int k = 0; k < Q_TOPK; k++) {
-            w[k] = sc[sel[k]];
-            sum += w[k];
-        }
-        const float norm = Q_ROUTED_SCALE / (sum + 1e-20f);
-        for (int k = 0; k < Q_TOPK; k++) w[k] *= norm;
-        diag_routing(l, sel, w, Q_TOPK, e->n_past + t);
-        if (n == 1 && e->pred_valid[l]) {         // how well the previous block's lookahead predicted this routing
+        float w[Q_TOPK];
+        route(logits + (size_t)t * Q_N_EXPERT, L->router_bias, sel, w);
+        diag_routing(mi, sel, w, Q_TOPK, e->n_past + t);
+        if (n == 1 && e->pred_valid[l]) {         // how well the previous layer's lookahead predicted this routing
             int covered = 0;
             for (int k = 0; k < Q_TOPK; k++)
                 for (int q = 0; q < Q_TOPK; q++) if (e->pred[l][q] == sel[k]) { covered++; break; }
@@ -637,151 +603,145 @@ static void moe_block(inz_engine *e, const q_layer *L, int dl, int n, const floa
             u->ntok++;
         }
     }
-    diag_add(DG_ROUTER, dl, t0, q_lin_bytes(&L->router), 2ull * n * Q_N_EXPERT * Q_H);
-    // routed experts: read requests for every missing one first, then the next block's predicted experts
-    // (decode), then the latent projection and the resident experts while the SSD works, then the rest as they
-    // arrive
+    diag_add(DG_ROUTER, l, t0, q_lin_bytes(&L->router), 2ull * n * Q_N_EXPERT * Q_H);
+    // routed experts: read requests for every missing one first, then the shared expert and the resident experts
+    // while the SSD works, then the rest as they arrive
     bool done[Q_N_EXPERT] = {0}, asked[Q_N_EXPERT] = {0};
     int left = nu, lvl;
     if (n <= EB_TOK)
         for (int i = 0; i < nu; i++)
-            if (!ec_is_resident(e->ec, l, units[i].expert)) { ec_request(e->ec, l, units[i].expert, 1.0f, EC_FULL); asked[i] = true; }
-    const q_layer *Ln = next_moe(e, dl);
-    if (n <= EB_TOK && e->opt.lookahead == 2 && Ln && !e->ec_all_resident) {
-        // early lookahead (--lookahead 2): this block's MoE input through the next MoE block's router predicts its
-        // experts; earlier but less precise than the late one (run_block)
-        const uint64_t tl = diag_tsc();
-        float *lg2 = e->tmp + (size_t)n * Q_N_EXPERT;
-        lin_mm(e, &Ln->router, xin, Q_H, n, lg2, Q_N_EXPERT);
-        for (int t = 0; t < n; t++) {
-            float ch[Q_N_EXPERT];
-            const float *lg = lg2 + (size_t)t * Q_N_EXPERT;
-            for (int x = 0; x < Q_N_EXPERT; x++) ch[x] = sigmoidf(lg[x]) + Ln->router_bias[x];
-            int32_t ps[Q_TOPK];
-            topk_f32(ch, Q_N_EXPERT, Q_TOPK, ps);
-            for (int k = 0; k < Q_TOPK; k++) ec_prefetch(e->ec, Ln->idx, ps[k], 0.5f, EC_FULL);
-            if (n == 1) { memcpy(e->pred[Ln->idx], ps, sizeof(ps)); e->pred_valid[Ln->idx] = true; g_diag.pred_total += Q_TOPK; }
-        }
-        diag_add(DG_PREFETCH, dl, tl, q_lin_bytes(&Ln->router), 0);
-    }
-    // latent input, and the shared expert, while the requested experts are arriving
+            if (!ec_is_resident(ec, xl, units[i].expert)) { ec_request(ec, xl, units[i].expert, 1.0f, EC_FULL); asked[i] = true; }
     t0 = diag_tsc();
-    float *xlat = e->xlat;
-    lin_mm(e, &L->lat_in, xin, Q_H, n, xlat, Q_LAT);
-    float *U = e->big, *D = e->tmp2;            // [n][5376], [n][H]
-    lin_mm(e, &L->sh_up, xin, Q_H, n, U, Q_SHARED_FF);
-    relu2(U, n * Q_SHARED_FF);
-    lin_mm(e, &L->sh_down, U, Q_SHARED_FF, n, D, Q_H);
-    diag_add(DG_SHARED, dl, t0, q_lin_bytes(&L->lat_in) + q_lin_bytes(&L->sh_up) + q_lin_bytes(&L->sh_down), 0);
+    float *GU = e->big, *D = e->tmp2;           // [n][2048], [n][H]
+    lin_mm(e, &L->sh_gu, xin, Q_H, n, GU, 2 * Q_SHARED_FF);
+    for (int t = 0; t < n; t++) swiglu(GU + (size_t)t * 2 * Q_SHARED_FF, Q_SHARED_FF);
+    lin_mm(e, &L->sh_down, GU, 2 * Q_SHARED_FF, n, D, Q_H);
+    diag_add(DG_SHARED, l, t0, q_lin_bytes(&L->sh_gu) + q_lin_bytes(&L->sh_down), 0);
     t0 = diag_tsc();
-    const bool batch = n <= EB_TOK && !e->imx_exp && !float_act(e->expert_type);
+    const bool batch = n <= EB_TOK && !e->imx_exp && !float_act(xc->type);
     const unit *bu[EB_MAX];
     const uint8_t *bb[EB_MAX];
     int nb = 0;
     for (int i = 0; i < nu; i++) {
-        const uint8_t *b = ec_try_acquire(e->ec, l, units[i].expert, 1.0f, EC_FULL, &lvl);
-        if (!b) { if (!asked[i]) ec_request(e->ec, l, units[i].expert, 1.0f, EC_FULL); continue; }
+        const uint8_t *b = ec_try_acquire(ec, xl, units[i].expert, 1.0f, EC_FULL, &lvl);
+        if (!b) { if (!asked[i]) ec_request(ec, xl, units[i].expert, 1.0f, EC_FULL); continue; }
         if (batch) { bu[nb] = &units[i]; bb[nb++] = b; }
         else {
-            expert_compute(e, b, &units[i], xlat, e->moe_lat);
-            ec_release(e->ec, l, units[i].expert);
+            expert_compute(e, xc, b, &units[i], xin, e->moe_out);
+            ec_release(ec, xl, units[i].expert);
         }
         done[i] = true;
         left--;
     }
     if (nb) {
-        experts_batch(e, bu, bb, nb, n, xlat);
-        for (int i = 0; i < nb; i++) ec_release(e->ec, l, bu[i]->expert);
+        experts_batch(e, xc, bu, bb, nb, n, xin);
+        for (int i = 0; i < nb; i++) ec_release(ec, xl, bu[i]->expert);
     }
-    diag_add(DG_EXPERT_HIT, dl, t0, (uint64_t)(nu - left) * e->blob_bytes, 0);
+    diag_add(DG_EXPERT_HIT, l, t0, (uint64_t)(nu - left) * xc->blob_bytes, 0);
     t0 = diag_tsc();
     while (left > 0) {
         bool progress = false;
         nb = 0;
         for (int i = 0; i < nu; i++) {
             if (done[i]) continue;
-            const uint8_t *b = ec_try_acquire(e->ec, l, units[i].expert, 0, EC_FULL, &lvl);
+            const uint8_t *b = ec_try_acquire(ec, xl, units[i].expert, 0, EC_FULL, &lvl);
             if (!b) continue;
             if (batch) { bu[nb] = &units[i]; bb[nb++] = b; }
             else {
-                expert_compute(e, b, &units[i], xlat, e->moe_lat);
-                ec_release(e->ec, l, units[i].expert);
+                expert_compute(e, xc, b, &units[i], xin, e->moe_out);
+                ec_release(ec, xl, units[i].expert);
             }
             done[i] = true;
             left--;
             progress = true;
         }
         if (nb) {
-            experts_batch(e, bu, bb, nb, n, xlat);
-            for (int i = 0; i < nb; i++) ec_release(e->ec, l, bu[i]->expert);
+            experts_batch(e, xc, bu, bb, nb, n, xin);
+            for (int i = 0; i < nb; i++) ec_release(ec, xl, bu[i]->expert);
         }
         if (progress || left == 0) continue;
-        diag_add(DG_EXPERT_MISS, dl, t0, 0, 0);
+        diag_add(DG_EXPERT_MISS, l, t0, 0, 0);
         t0 = diag_tsc();
-        if (!ec_wait_any(e->ec)) {              // nothing in flight: fall back to a blocking read
+        if (!ec_wait_any(ec)) {                 // nothing in flight: fall back to a blocking read
             for (int i = 0; i < nu; i++)
                 if (!done[i]) {
-                    const uint8_t *b = ec_acquire(e->ec, l, units[i].expert, 0, EC_FULL, &lvl);
-                    diag_add(DG_EXPERT_WAIT, dl, t0, 0, 0);
+                    const uint8_t *b = ec_acquire(ec, xl, units[i].expert, 0, EC_FULL, &lvl);
+                    diag_add(DG_EXPERT_WAIT, l, t0, 0, 0);
                     t0 = diag_tsc();
-                    expert_compute(e, b, &units[i], xlat, e->moe_lat);
-                    ec_release(e->ec, l, units[i].expert);
+                    expert_compute(e, xc, b, &units[i], xin, e->moe_out);
+                    ec_release(ec, xl, units[i].expert);
                     done[i] = true;
                     left--;
-                    diag_add(DG_EXPERT_MISS, dl, t0, e->blob_bytes, 0);
+                    diag_add(DG_EXPERT_MISS, l, t0, xc->blob_bytes, 0);
                     t0 = diag_tsc();
                     break;
                 }
         }
-        diag_add(DG_EXPERT_WAIT, dl, t0, 0, 0);
+        diag_add(DG_EXPERT_WAIT, l, t0, 0, 0);
         t0 = diag_tsc();
     }
-    diag_add(DG_EXPERT_MISS, dl, t0, 0, 0);
-    // routed outputs in rank order (deterministic), back to the hidden size, plus the shared expert
-    t0 = diag_tsc();
-    float *ls = e->tmp;                          // [n][LAT] (the router logits are no longer needed)
+    diag_add(DG_EXPERT_MISS, l, t0, 0, 0);
+    // routed outputs in rank order (deterministic), plus the shared expert
     for (int t = 0; t < n; t++) {
-        float *st = ls + (size_t)t * Q_LAT;
-        memcpy(st, e->moe_lat + (size_t)t * Q_TOPK * Q_LAT, sizeof(float) * Q_LAT);
+        float *yt = y + (size_t)t * Q_H;
+        memcpy(yt, e->moe_out + (size_t)t * Q_TOPK * Q_H, sizeof(float) * Q_H);
         for (int k = 1; k < Q_TOPK; k++) {
-            const float *o = e->moe_lat + ((size_t)t * Q_TOPK + k) * Q_LAT;
-            for (int c = 0; c < Q_LAT; c++) st[c] += o[c];
+            const float *o = e->moe_out + ((size_t)t * Q_TOPK + k) * Q_H;
+            for (int c = 0; c < Q_H; c++) yt[c] += o[c];
         }
     }
-    lin_mm(e, &L->lat_out, ls, Q_LAT, n, y, Q_H);
     add_rows(y, D, n);
-    diag_add(DG_SHARED, dl, t0, q_lin_bytes(&L->lat_out), 0);
-    diag_add_ssd(DG_PREFETCH, dl, ec_read_bytes(e->ec) - io_start);
+    diag_add_ssd(DG_PREFETCH, l, ec_read_bytes(ec) - io_start);
+}
+
+// Router lookahead (--lookahead 1, the default): once layer l has updated the residual, layer l + 1's MLP norm and
+// router on it predict that layer's experts, which are prefetched while its attention runs. The early variant
+// (--lookahead 2, from the MoE input) exists in the Nemotron branch; here the next router is only one attention
+// block away, so the late prediction is both close and early enough.
+static void moe_lookahead(inz_engine *e, int l, int n, const float *X) {
+    if (l + 1 >= e->n_layer || n > EB_TOK || !e->opt.lookahead) return;
+    const q_layer *Ln = &e->L[l + 1];
+    if (!Ln->xc || !Ln->xc->ec || Ln->xc->all_resident) return;
+    const uint64_t t0 = diag_tsc();
+    norm_rows(e, X, Q_H, n, e->Xn, Q_H, Ln->mlp_norm);
+    float *lg = e->tmp;
+    lin_mm(e, &Ln->router, e->Xn, Q_H, n, lg, Q_N_EXPERT);
+    for (int t = 0; t < n; t++) {
+        int32_t ps[Q_TOPK];
+        float w[Q_TOPK];
+        route(lg + (size_t)t * Q_N_EXPERT, Ln->router_bias, ps, w);
+        for (int k = 0; k < Q_TOPK; k++) ec_prefetch(Ln->xc->ec, Ln->xl, ps[k], 0.75f, EC_FULL);
+        if (n == 1) { memcpy(e->pred[l + 1], ps, sizeof(ps)); e->pred_valid[l + 1] = true; g_diag.pred_total += Q_TOPK; }
+    }
+    diag_add(DG_PREFETCH, l, t0, q_lin_bytes(&Ln->router), 0);
 }
 
 /* ------------------------------------------------------------------ */
 /* Scratch, state, forward                                             */
 /* ------------------------------------------------------------------ */
 
-#define ACT_MAX Q_MB_INNER                      // widest input of a matrix with int8 activations
+#define ACT_MAX Q_DENSE_FF                      // widest input of a matrix with int8 activations (layer 0 down)
 
 void q_scratch_alloc(inz_engine *e) {
     const size_t T = Q_MAX_T;
     e->X = inz_aligned(64, sizeof(float) * T * Q_H);
-    e->X2 = inz_aligned(64, sizeof(float) * T * Q_H);
+    e->X2 = inz_aligned(64, sizeof(float) * 64 * Q_H);
     e->Xn = inz_aligned(64, sizeof(float) * T * Q_H);
     e->y = inz_aligned(64, sizeof(float) * T * Q_H);
-    e->tmp = inz_aligned(64, sizeof(float) * T * Q_MB_CONV);
-    e->tmp2 = inz_aligned(64, sizeof(float) * T * Q_MB_INNER);
-    e->big = inz_aligned(64, sizeof(float) * T * Q_MB_PROJ);
-    e->mb_dt = inz_aligned(64, sizeof(float) * T * Q_MB_NH);
-    e->xlat = inz_aligned(64, sizeof(float) * T * Q_LAT);
-    e->moe_lat = inz_aligned(64, sizeof(float) * T * Q_TOPK * Q_LAT);
-    e->ex_x = inz_aligned(64, sizeof(float) * T * Q_LAT);
-    e->ex_up = inz_aligned(64, sizeof(float) * T * Q_FF);
-    e->ex_d = inz_aligned(64, sizeof(float) * T * Q_LAT);
+    e->tmp = inz_aligned(64, sizeof(float) * T * 2 * Q_KV);          // k | v; router logits; head rows
+    e->tmp2 = inz_aligned(64, sizeof(float) * T * Q_H);              // gates; shared expert output
+    e->big = inz_aligned(64, sizeof(float) * T * 2 * Q_DENSE_FF);    // q | attention output; dense gate|up
+    e->moe_out = inz_aligned(64, sizeof(float) * T * Q_TOPK * Q_H);
+    e->ex_x = inz_aligned(64, sizeof(float) * T * Q_H);
+    e->ex_gu = inz_aligned(64, sizeof(float) * T * 2 * Q_FF);
+    e->ex_d = inz_aligned(64, sizeof(float) * T * Q_H);
     e->eb_items = inz_calloc(EB_MAX, sizeof(ebatch_item));
-    e->eb_up = inz_aligned(64, sizeof(float) * EB_MAX * Q_FF);
-    e->eb_d = inz_aligned(64, sizeof(float) * EB_MAX * Q_LAT);
+    e->eb_gu = inz_aligned(64, sizeof(float) * EB_MAX * 2 * Q_FF);
+    e->eb_d = inz_aligned(64, sizeof(float) * EB_MAX * Q_H);
     e->eb_acts = inz_calloc(EB_MAX, sizeof(inz_act));
     for (int i = 0; i < EB_MAX; i++) inz_act_alloc(&e->eb_acts[i], Q_FF);
     e->eb_xa = inz_calloc(EB_TOK, sizeof(inz_act));
-    for (int i = 0; i < EB_TOK; i++) inz_act_alloc(&e->eb_xa[i], Q_LAT);
+    for (int i = 0; i < EB_TOK; i++) inz_act_alloc(&e->eb_xa[i], Q_H);
     e->units = inz_calloc(Q_N_EXPERT, sizeof(unit));
     e->acts = inz_calloc(T, sizeof(inz_act));
     for (size_t i = 0; i < T; i++) inz_act_alloc(&e->acts[i], ACT_MAX);
@@ -798,11 +758,11 @@ void q_scratch_alloc(inz_engine *e) {
 }
 
 void q_scratch_free(inz_engine *e) {
-    free(e->X); free(e->X2); free(e->Xn); free(e->y); free(e->tmp); free(e->tmp2); free(e->big); free(e->mb_dt);
-    free(e->xlat); free(e->moe_lat); free(e->ex_x); free(e->ex_up); free(e->ex_d); free(e->units);
+    free(e->X); free(e->X2); free(e->Xn); free(e->y); free(e->tmp); free(e->tmp2); free(e->big);
+    free(e->moe_out); free(e->ex_x); free(e->ex_gu); free(e->ex_d); free(e->units);
     for (int i = 0; i < EB_MAX; i++) inz_act_free(&e->eb_acts[i]);
     for (int i = 0; i < EB_TOK; i++) inz_act_free(&e->eb_xa[i]);
-    free(e->eb_items); free(e->eb_up); free(e->eb_d); free(e->eb_acts); free(e->eb_xa);
+    free(e->eb_items); free(e->eb_gu); free(e->eb_d); free(e->eb_acts); free(e->eb_xa);
     for (int i = 0; i < Q_MAX_T; i++) inz_act_free(&e->acts[i]);
     free(e->acts);
     const int nthr = tp_size(e->tp);
@@ -812,55 +772,32 @@ void q_scratch_free(inz_engine *e) {
 }
 
 void q_state_reset(inz_engine *e) {
-    memset(e->st.S, 0, sizeof(float) * (size_t)Q_N_MAMBA * Q_MB_NH * Q_MB_HD * Q_MB_DS);
-    memset(e->st.conv, 0, sizeof(float) * (size_t)Q_N_MAMBA * (Q_MB_KS - 1) * Q_MB_CONV);
-    e->n_past = 0;
+    e->n_past = 0;  // the caches are positional: nothing to clear
     e->mtp_valid = 0;
 }
 
-// Router lookahead (--lookahead 1, the default): once a MoE block has updated the residual, the next MoE block's own
-// norm and router on it predict that block's experts (only a Mamba or attention block lies in between), and they are
-// prefetched while that block runs. On the first blocks this predicts 69% of the experts against 53% for the early
-// lookahead from the MoE input, and the shorter lead time costs less than the extra precision gains.
-static void moe_lookahead_late(inz_engine *e, int dl, int n, const float *X) {
-    const q_layer *Ln = next_moe(e, dl);
-    if (!Ln || n > EB_TOK || !e->ec || e->ec_all_resident) return;
-    const uint64_t t0 = diag_tsc();
-    norm_rows(e, X, Q_H, n, e->Xn, Q_H, Ln->norm);
-    float *lg = e->tmp;
-    lin_mm(e, &Ln->router, e->Xn, Q_H, n, lg, Q_N_EXPERT);
-    for (int t = 0; t < n; t++) {
-        float ch[Q_N_EXPERT];
-        for (int x = 0; x < Q_N_EXPERT; x++) ch[x] = sigmoidf(lg[(size_t)t * Q_N_EXPERT + x]) + Ln->router_bias[x];
-        int32_t ps[Q_TOPK];
-        topk_f32(ch, Q_N_EXPERT, Q_TOPK, ps);
-        for (int k = 0; k < Q_TOPK; k++) ec_prefetch(e->ec, Ln->idx, ps[k], 0.75f, EC_FULL);
-        if (n == 1) { memcpy(e->pred[Ln->idx], ps, sizeof(ps)); e->pred_valid[Ln->idx] = true; g_diag.pred_total += Q_TOPK; }
-    }
-    diag_add(DG_PREFETCH, dl, t0, q_lin_bytes(&Ln->router), 0);
-}
-
-// one block on rows X [n][H]: X += mixer(rmsnorm(X) * norm); dl: block index for diagnostics
-static void run_block(inz_engine *e, const q_layer *L, int dl, int ai, int n, int p0, float *X) {
+// one decoder layer on rows X [n][H]: X += attn(norm(X)); X += mlp(norm(X))
+static void run_layer(inz_engine *e, int l, int n, int p0, float *X) {
+    const q_layer *L = &e->L[l];
     uint64_t t0 = diag_tsc();
-    norm_rows(e, X, Q_H, n, e->Xn, Q_H, L->norm);
-    diag_add(L->kind == QB_MOE ? DG_FFN_NORM : DG_ATTN_NORM, dl, t0, 0, 0);
+    norm_rows(e, X, Q_H, n, e->Xn, Q_H, L->attn_norm);
+    diag_add(DG_ATTN_NORM, l, t0, 0, 0);
     t0 = diag_tsc();
-    switch (L->kind) {
-    case QB_MAMBA:
-        mamba_block(e, L, n, e->Xn, e->y);
-        diag_add(DG_ATTN_CORE, dl, t0, q_lin_bytes(&L->mb_in) + q_lin_bytes(&L->mb_out), 0);
-        break;
-    case QB_ATTN:
-        attn_block(e, L, ai, n, p0, e->Xn, e->y);
-        diag_add(DG_ATTN_QKV, dl, t0, q_lin_bytes(&L->at_q) + q_lin_bytes(&L->at_k) + q_lin_bytes(&L->at_v) + q_lin_bytes(&L->at_o), 0);
-        break;
-    default:
-        moe_block(e, L, dl, n, e->Xn, e->y);
-        break;
+    attn_block(e, L, l, n, p0, e->Xn, e->y);
+    diag_add(DG_ATTN_QKV, l, t0, q_lin_bytes(&L->at_q) + q_lin_bytes(&L->at_k) + q_lin_bytes(&L->at_v) + q_lin_bytes(&L->at_o) +
+                                     q_lin_bytes(&L->at_g), 0);
+    add_rows(X, e->y, n);
+    t0 = diag_tsc();
+    norm_rows(e, X, Q_H, n, e->Xn, Q_H, L->mlp_norm);
+    diag_add(DG_FFN_NORM, l, t0, 0, 0);
+    if (L->xc) moe_block(e, L, l, n, e->Xn, e->y);
+    else {
+        t0 = diag_tsc();
+        dense_block(e, L, n, e->Xn, e->y);
+        diag_add(DG_DENSE_FFN, l, t0, q_lin_bytes(&L->d_gu) + q_lin_bytes(&L->d_down), 0);
     }
     add_rows(X, e->y, n);
-    if (L->kind == QB_MOE && e->opt.lookahead == 1) moe_lookahead_late(e, dl, n, X);
+    moe_lookahead(e, l, n, X);
 }
 
 void q_forward(inz_engine *e, const int32_t *tokens, int n, const int *logits_rows, int n_logits, float *out_logits) {
@@ -871,7 +808,7 @@ void q_forward(inz_engine *e, const int32_t *tokens, int n, const int *logits_ro
     uint64_t t0 = diag_tsc();
     for (int t = 0; t < n; t++) embed_row(e, tokens[t], e->X + (size_t)t * Q_H);
     diag_add(DG_EMBED, -1, t0, (uint64_t)n * Q_H * 2, 0);
-    static FILE *dump;  // validation: INZ_DUMP_HIDDEN=file appends the residual after every block
+    static FILE *dump;  // validation: INZ_DUMP_HIDDEN=file appends the residual after every layer
     static int dump_init;
     if (!dump_init) {
         dump_init = 1;
@@ -879,20 +816,21 @@ void q_forward(inz_engine *e, const int32_t *tokens, int n, const int *logits_ro
         if (pth && *pth) dump = fopen(pth, "wb");
     }
     for (int l = 0; l < e->n_layer; l++) {
-        const q_layer *L = &e->L[l];
-        run_block(e, L, l, L->idx, n, p0, e->X);
+        run_layer(e, l, n, p0, e->X);
         if (dump) { fwrite(e->X, sizeof(float), (size_t)n * Q_H, dump); fflush(dump); }
     }
     e->n_past += n;
     memcpy(e->x_last, e->X + (size_t)(n - 1) * Q_H, sizeof(float) * Q_H);
-    if (e->ec) ec_tick(e->ec, n);
+    for (int c = 0; c < e->n_xc; c++) if (e->xc[c].ec) ec_tick(e->xc[c].ec, n);
     if (n_logits <= 0) return;
-    float *rows = e->X2;                        // final norm of the requested rows (X2 is the MTP's, free here)
-    for (int i = 0; i < n_logits; i++) rmsnorm(rows + (size_t)i * Q_H, e->X + (size_t)logits_rows[i] * Q_H, e->norm_f, Q_H);
-    if (n_logits > 64) inz_die("q_forward: %d logits rows (max 64)", n_logits);
+    float *rows = e->X2;                        // final norm of the requested rows, 64 at a time
     int seq[64];
-    for (int i = 0; i < n_logits; i++) seq[i] = i;
-    q_head(e, rows, n_logits, seq, n_logits, out_logits);
+    for (int i = 0; i < 64; i++) seq[i] = i;
+    for (int g = 0; g < n_logits; g += 64) {
+        const int k = n_logits - g < 64 ? n_logits - g : 64;
+        for (int i = 0; i < k; i++) rmsnorm(rows + (size_t)i * Q_H, e->X + (size_t)logits_rows[g + i] * Q_H, e->norm_f, Q_H);
+        q_head(e, rows, k, seq, k, out_logits + (size_t)g * Q_VOCAB);
+    }
 }
 
 void q_head(inz_engine *e, const float *Hn, int n, const int *logits_rows, int n_logits, float *out_logits) {
@@ -904,36 +842,8 @@ void q_head(inz_engine *e, const float *Hn, int n, const int *logits_rows, int n
     diag_add(DG_LM_HEAD, -1, t0, q_lin_bytes(&e->head), 2ull * n_logits * Q_VOCAB * Q_H);
 }
 
-/* ------------------------------------------------------------------ */
-/* MTP: one attention + MoE step that drafts token p+2 from (h_p, p+1) */
-/* ------------------------------------------------------------------ */
-
 void q_mtp_forward(inz_engine *e, const float *H, int ldh, bool residual, const int32_t *next, int n, int p0,
                    const int *logits_rows, int n_logits, float *out_logits) {
-    if (n > Q_MAX_T) inz_die("q_mtp_forward: %d tokens > %d", n, Q_MAX_T);
-    const diag_phase phase = g_diag.phase;
-    diag_set_phase(PH_DRAFT);
-    g_diag.phase_tokens[PH_DRAFT] += (uint64_t)n;
-    const q_mtp *M = &e->mtp;
-    const int dl = e->n_layer;                  // the MTP blocks in diagnostics: n_layer, n_layer + 1
-    uint64_t t0 = diag_tsc();
-    // F = [enorm(embed(next)) | hnorm(h)], with h = norm_f(residual) for rows of the main model; read before X2 is
-    // written (a chained step passes X2 itself)
-    float *F = e->big;                          // [n][2H]
-    for (int t = 0; t < n; t++) {
-        float x[Q_H], h[Q_H];
-        embed_row(e, next[t], x);
-        rmsnorm(F + (size_t)t * 2 * Q_H, x, M->enorm, Q_H);
-        const float *src = H + (size_t)t * ldh;
-        if (residual) { rmsnorm(h, src, e->norm_f, Q_H); src = h; }
-        rmsnorm(F + (size_t)t * 2 * Q_H + Q_H, src, M->hnorm, Q_H);
-    }
-    float *X = e->X2;
-    lin_mm(e, &M->eh, F, 2 * Q_H, n, X, Q_H);
-    diag_add(DG_DRAFT, -1, t0, q_lin_bytes(&M->eh), 0);
-    run_block(e, &M->at, dl, Q_N_ATTN, n, p0, X);
-    run_block(e, &M->moe, dl + 1, 0, n, p0, X);
-    norm_rows(e, X, Q_H, n, X, Q_H, M->final_norm);
-    if (n_logits > 0) q_head(e, X, n, logits_rows, n_logits, out_logits);
-    diag_set_phase(phase);
+    (void)e; (void)H; (void)ldh; (void)residual; (void)next; (void)n; (void)p0; (void)logits_rows; (void)n_logits; (void)out_logits;
+    inz_die("Laguna has no MTP head");
 }

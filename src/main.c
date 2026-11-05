@@ -31,7 +31,7 @@ static uint64_t parse_size(const char *s) {
 
 static void usage(void) {
     fprintf(stderr,
-            "inferenZ %s - Nemotron 3.5 Super on CPU with SSD expert streaming\n\n"
+            "inferenZ %s - Laguna S 2.1 on CPU with SSD expert streaming\n\n"
             "usage: inz <command> [options]\n\n"
             "commands:\n"
             "  serve    web UI, OpenAI-compatible API and live diagnostics\n"
@@ -41,17 +41,16 @@ static void usage(void) {
             "  dump     teacher-forced logits for validation\n"
             "  info     show GGUF metadata and tensors\n\n"
             "common options:\n"
-            "  -m, --model FILE        converted model (default models/nemotron-3.5-super.inz.gguf)\n"
+            "  -m, --model FILE        converted model (default models/laguna-s-2.1.inz.gguf)\n"
             "  -t, --threads N         compute threads (default: P+E cores)\n"
             "  -c, --ctx N             context length (default 32768)\n"
             "      --cache SIZE        expert cache budget, e.g. 40G (default: free RAM minus the reserve)\n"
             "      --ram-reserve GB    RAM left to the rest of the system when sizing the cache (default: max(10, 30%%))\n"
-            "      --effort E          reasoning: high (thinking on), medium (efficient thinking), none (off); default high\n"
+            "      --effort E          reasoning: high or medium (thinking on), none (off); default high\n"
             "      --temp T            sampling temperature for run (default 1.0, the model's own)\n"
             "      --no-spec           disable MTP speculative decoding\n"
             "      --spec-k N          tokens drafted per step by the MTP layer (1-3, default 1)\n"
-                        "      --lookahead N       decode: prefetch the experts the next MoE block's router predicts (1 from the updated\n"
-            "                          residual, default; 2 from the MoE input, earlier; 0 off)\n"
+            "      --lookahead N       decode: prefetch the experts the next layer's router predicts (1 on, 0 off)\n"
             "      --sqpoll CPU        io_uring submission thread on CPU (default: a low-power core; -1 off)\n"
             "      --cache-decay D     expert cache LRFU decay per token (default 0.01; 0 = LFU, 0.2 ~ LRU)\n"
             "      --hotlist F         expert warm-start scores: file, auto or off (default auto)\n"
@@ -81,7 +80,7 @@ static void parse_common(int argc, char **argv, cli *c) {
     c->host = "127.0.0.1";
     c->port = 8080;
     c->ntok = 128;
-    c->temp = 1.0f;   // the model's generation_config.json: temperature 1.0, top_p 0.95
+    c->temp = 1.0f;   // the model's generation_config.json: temperature 1.0, top_p 1.0, top_k 20
     int ch;
     optind = 1;
     while ((ch = getopt_long(argc, argv, "m:t:c:p:n:v", common_opts, NULL)) != -1) {
@@ -176,8 +175,8 @@ static int cmd_run(int argc, char **argv, bool bench) {
         memset(&go, 0, sizeof(go));
         sampler_default(&go.sp);
         go.sp.temperature = bench ? 0.0f : c.temp;
-        go.sp.top_p = 0.95f;
-        go.sp.top_k = 0;
+        go.sp.top_p = 1.0f;
+        go.sp.top_k = 20;
         go.max_tokens = bench ? c.ntok : 32768;
         const int32_t stops[2] = {engine_eos(e), engine_eot(e)};
         go.stop_ids = stops;
@@ -248,9 +247,9 @@ static int cmd_convert(int argc, char **argv) {
     convert_opts_default(&o);
     static const struct option lo[] = {
         {"src", required_argument, 0, 's'}, {"out", required_argument, 0, 'o'}, {"experts", required_argument, 0, 1},
-        {"mamba", required_argument, 0, 2}, {"attn", required_argument, 0, 3}, {"shared", required_argument, 0, 4},
-        {"router", required_argument, 0, 5}, {"latent", required_argument, 0, 6}, {"head", required_argument, 0, 7},
-        {"embed", required_argument, 0, 12}, {"layers", required_argument, 0, 8}, {"mtp", required_argument, 0, 9},
+        {"experts-bf16", required_argument, 0, 2}, {"attn", required_argument, 0, 3}, {"shared", required_argument, 0, 4},
+        {"router", required_argument, 0, 5}, {"dense", required_argument, 0, 6}, {"head", required_argument, 0, 7},
+        {"embed", required_argument, 0, 12}, {"layers", required_argument, 0, 8},
         {"imatrix", required_argument, 0, 14}, {"threads", required_argument, 0, 't'}, {"verbose", no_argument, 0, 'v'}, {0, 0, 0, 0}};
     int ch;
     optind = 1;
@@ -261,22 +260,19 @@ static int cmd_convert(int argc, char **argv) {
         case 't': o.threads = atoi(optarg); break;
         case 'v': inz_log_level++; break;
         case 1: o.t_experts = qtype_arg(optarg); break;
-        case 2: o.t_mamba = qtype_arg(optarg); break;
+        case 2: o.t_experts_bf16 = qtype_arg(optarg); break;
         case 3: o.t_attn = qtype_arg(optarg); break;
         case 4: o.t_shared = qtype_arg(optarg); break;
         case 5: o.t_router = qtype_arg(optarg); break;
-        case 6: o.t_latent = qtype_arg(optarg); break;
+        case 6: o.t_dense = qtype_arg(optarg); break;
         case 7: o.t_head = qtype_arg(optarg); break;
         case 8: o.max_layers = atoi(optarg); break;
-        case 9: o.t_mtp = qtype_arg(optarg); break;
         case 12: o.t_embed = qtype_arg(optarg); break;
         case 14: o.imatrix = optarg; break;
         default:
-            fprintf(stderr, "usage: inz convert --src DIR --out FILE [--experts T] [--shared T] [--mamba T] [--attn T]\n"
-                            "                   [--latent T] [--router T] [--mtp T] [--head T] [--embed T] [--layers N]\n"
-                            "                   [--imatrix FILE]\n"
-                            "types: F8T (FP8 sources, exact), Q4N (NVFP4 sources, exact), F16 (exact for BF16 sources), F32,\n"
-                            "       Q8G, Q4L, Q3L, Q2L\n");
+            fprintf(stderr, "usage: inz convert --src DIR --out FILE [--experts-bf16 T] [--attn T] [--dense T] [--shared T]\n"
+                            "                   [--router T] [--head T] [--embed T] [--layers N] [--imatrix FILE]\n"
+                            "types: Q4N (NVFP4 experts, exact), F16 (exact for BF16 sources), F32, Q8G, Q4L, Q3L, Q2L\n");
             return 1;
         }
     }
