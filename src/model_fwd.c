@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include <immintrin.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,8 @@ bool q_bind_lin(lin *m, int type, int rows, int cols, const uint8_t *data) {
 }
 
 uint64_t q_lin_bytes(const lin *W) { return inz_mat_bytes(W->type, W->rows, W->cols); }
+
+static inline bool float_act(int type) { return type == INZ_T_F32 || type == INZ_T_F16; }
 
 typedef struct { const lin *W; const float *X; int ldx, n; float *Y; int ldy; const inz_act *acts; } mm_job;
 
@@ -207,17 +210,33 @@ void q_imx_write(inz_engine *e) {
     LOGI("imatrix: %u entries written to %s", count, e->imx_path);
 }
 
-// Y[t*ldy + r] = W[r] . X[t*ldx]  for t < n, r < W->rows
+static void mm_group_run(inz_engine *e, const lin *const *W, float *const *Y, const int *ldy, int nw, const float *X, int ldx,
+                         int n, const inz_qmat *qm, bool quantize);
+
+// rows per task of a matvec / small matmul
+static int mm_grain(const lin *W, int n) {
+    return W->type == INZ_T_F16 && n > 1 ? (W->cols >= 6144 ? 12 : 24) : W->cols >= 6144 ? 16 : 32;
+}
+
+// Y[t*ldy + r] = W[r] . X[t*ldx]  for t < n, r < W->rows. `prev`: the matrix run just before on the same input,
+// whose quantized activation can be reused.
 static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const float *X, int ldx, int n, float *Y, int ldy) {
     if (W->imx) {
         imx_entry *x = &e->imx[W->imx - 1];
         imx_add(x->acc, X, ldx, n, W->cols);
         x->n += (uint64_t)n;
     }
-    if (W->type != INZ_T_F32 && W->type != INZ_T_F16) {
+    if (n < GEMM_MIN_T && !W->imx) {
+        const inz_qmat *qm = float_act(W->type) ? NULL : &W->q;
+        const bool reuse = qm && prev && !float_act(prev->type) && prev->cols == W->cols && prev->q.rot_block == qm->rot_block &&
+                           prev->q.rot_seed == qm->rot_seed;
+        mm_group_run(e, &W, &Y, &ldy, 1, X, ldx, n, qm, !reuse);
+        return;
+    }
+    if (!float_act(W->type)) {
         const inz_qmat *m = &W->q;
-        const bool reuse = prev && prev->type != INZ_T_F32 && prev->type != INZ_T_F16 &&
-                           prev->cols == W->cols && prev->q.rot_block == m->rot_block && prev->q.rot_seed == m->rot_seed;
+        const bool reuse = prev && !float_act(prev->type) && prev->cols == W->cols && prev->q.rot_block == m->rot_block &&
+                           prev->q.rot_seed == m->rot_seed;
         if (n >= GEMM_MIN_T) {
             if (!reuse) {
                 inz_xq_begin(&e->gemm_x, n, m->cols, m->rot_block, m->rot_seed);
@@ -234,12 +253,112 @@ static void lin_mm_after(inz_engine *e, const lin *W, const lin *prev, const flo
         }
     }
     mm_job j = {W, X, ldx, n, Y, ldy, e->acts};
-    const int grain = W->type == INZ_T_F16 && n > 1 ? (W->cols >= 6144 ? 12 : 24) : W->cols >= 6144 ? 16 : 32;
-    tp_for(e->tp, W->rows, grain, mm_task, &j);
+    tp_for(e->tp, W->rows, mm_grain(W, n), mm_task, &j);
 }
 
 static void lin_mm(inz_engine *e, const lin *W, const float *X, int ldx, int n, float *Y, int ldy) {
     lin_mm_after(e, W, NULL, X, ldx, n, Y, ldy);
+}
+
+// Several matrices on the same input in one dispatch, for a few tokens: one wake-up of the pool instead of one per
+// matrix, and the small matrices stream at the big one's bandwidth. The input is quantized by the same dispatch:
+// its first tasks quantize slices of it in parallel (when the previous kernels' threads hold its cache lines, a
+// single thread would fetch them one by one), the others wait for them and then run rows.
+#define MMG_MAX 4
+#define MMG_SLICE 256
+typedef struct {
+    mm_job j[MMG_MAX];
+    int start[MMG_MAX + 1], rows[MMG_MAX];   // first row block and rows per block of each matrix (after the slices)
+    int nq, sl, spt;                         // quantization slices: count, elements per slice, slices per token
+    inz_act *a;
+    const float *x;
+    int ldx;
+    atomic_int qleft;
+} mmg_job;
+
+// elements per quantization slice of a K-wide input: a power of 2 that divides K, at most MMG_SLICE (0: none fits
+// the rotation)
+static int mmg_slice(int K, int rot_block) {
+    int sl = K & -K;
+    if (sl > MMG_SLICE) sl = MMG_SLICE;
+    return sl >= INZ_GROUP && rot_block <= sl ? sl : 0;
+}
+
+// slice k of the inputs of n tokens: token k / spt, elements [(k % spt) sl, + sl)
+static void mmg_quantize(inz_act *a, const float *x, int ldx, int sl, int spt, int k) {
+    const int t = k / spt, i0 = k % spt * sl;
+    inz_act_quantize_part(&a[t], x + (size_t)t * ldx, i0, i0 + sl);
+}
+
+static void mmg_task(void *ctx, int64_t b, int64_t e_, int tid) {
+    mmg_job *g = ctx;
+    for (int64_t k = b; k < e_; k++) {
+        if (k < g->nq) {
+            mmg_quantize(g->a, g->x, g->ldx, g->sl, g->spt, (int)k);
+            atomic_fetch_sub_explicit(&g->qleft, 1, memory_order_release);
+            continue;
+        }
+        // slices are handed out first, so every one still pending is held by a running thread
+        while (atomic_load_explicit(&g->qleft, memory_order_acquire) > 0) _mm_pause();
+        const int64_t kb = k - g->nq;
+        int w = 0;
+        while (kb >= g->start[w + 1]) w++;
+        const int r0 = (int)(kb - g->start[w]) * g->rows[w], rows = g->j[w].W->rows;
+        mm_task(&g->j[w], r0, r0 + g->rows[w] < rows ? r0 + g->rows[w] : rows, tid);
+    }
+}
+
+// whether the group can run as one dispatch: no importance matrix, same input width, one rotation for the quantized
+static bool mm_groupable(const lin *const *W, int nw, int n, const inz_qmat **qm) {
+    *qm = NULL;
+    if (n >= GEMM_MIN_T || nw > MMG_MAX) return false;
+    for (int i = 0; i < nw; i++) {
+        if (W[i]->imx || W[i]->cols != W[0]->cols) return false;
+        if (float_act(W[i]->type)) continue;
+        if (!*qm) *qm = &W[i]->q;
+        else if (W[i]->q.rot_block != (*qm)->rot_block || W[i]->q.rot_seed != (*qm)->rot_seed) return false;
+    }
+    return true;
+}
+
+// quantize: whether the input still has to be quantized (false when the previous matrix left it in e->acts)
+static void mm_group_run(inz_engine *e, const lin *const *W, float *const *Y, const int *ldy, int nw, const float *X, int ldx,
+                         int n, const inz_qmat *qm, bool quantize) {
+    mmg_job g;
+    g.nq = g.sl = g.spt = 0;
+    if (qm && quantize) {
+        const int K = W[0]->cols;
+        g.sl = mmg_slice(K, qm->rot_block);
+        if (g.sl) {
+            for (int t = 0; t < n; t++) inz_act_begin(&e->acts[t], K, qm->rot_block, qm->rot_seed);
+            g.spt = K / g.sl;
+            g.nq = n * g.spt;
+        } else {
+            aq_job aj = {e->acts, X, ldx, K, qm->rot_block, qm->rot_seed};
+            tp_for(e->tp, n, 1, aq_task, &aj);
+        }
+    }
+    g.a = e->acts;
+    g.x = X;
+    g.ldx = ldx;
+    atomic_init(&g.qleft, g.nq);
+    g.start[0] = 0;
+    for (int i = 0; i < nw; i++) {
+        g.j[i] = (mm_job){W[i], X, ldx, n, Y[i], ldy[i], e->acts};
+        g.rows[i] = mm_grain(W[i], n);
+        g.start[i + 1] = g.start[i] + (W[i]->rows + g.rows[i] - 1) / g.rows[i];
+    }
+    tp_for(e->tp, g.nq + g.start[nw], 1, mmg_task, &g);
+}
+
+static void lin_mm_group(inz_engine *e, const lin *const *W, float *const *Y, const int *ldy, int nw, const float *X, int ldx,
+                         int n) {
+    const inz_qmat *qm;
+    if (!mm_groupable(W, nw, n, &qm)) {
+        for (int i = 0; i < nw; i++) lin_mm_after(e, W[i], i ? W[i - 1] : NULL, X, ldx, n, Y[i], ldy[i]);
+        return;
+    }
+    mm_group_run(e, W, Y, ldy, nw, X, ldx, n, qm, true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -410,8 +529,10 @@ static void ple_forward(inz_engine *e, int n, int p0, float *X) {
     q_ple *P = &e->ple;
     ple_job j = {e, n, p0, X, e->tmp2, e->big, e->tmp, e->Xn};  // E [n][H], K [n][4H], V [n][H], G [n][4H]
     tp_for(e->tp, (int64_t)n * Q_NG_HEADS, 4, ple_gather_task, &j);
-    lin_mm(e, &P->key, j.E, Q_H, n, j.K, Q_HCW);
-    lin_mm_after(e, &P->value, &P->key, j.E, Q_H, n, j.V, Q_H);
+    const lin *W[2] = {&P->key, &P->value};
+    float *Y[2] = {j.K, j.V};
+    const int ldy[2] = {Q_HCW, Q_H};
+    lin_mm_group(e, W, Y, ldy, 2, j.E, Q_H, n);
     tp_for(e->tp, n, 1, ple_gate_task, &j);    // K now holds norm_conv(G)
     tp_for(e->tp, n, 1, ple_conv_task, &j);
     // the conv history becomes the last 9 normalized rows (part of the old history when the chunk is short)
@@ -541,12 +662,13 @@ static void dn_block(inz_engine *e, int l, int n, const float *xin, float *y) {
     const q_layer *L = &e->L[l];
     const int li = q_dn_index(l);
     float *qkv = e->big, *z = e->tmp2, *o = e->tmp, *cv = e->Xn;  // [n][10240], [n][6144], [n][6144], [n][10240]
-    lin_mm(e, &L->dn_qkv, xin, Q_H, n, qkv, Q_DN_CONV);
-    lin_mm_after(e, &L->dn_z, &L->dn_qkv, xin, Q_H, n, z, Q_DN_VAL);
     lin abl;
     q_bind_lin(&abl, INZ_T_F32, 2 * Q_DN_NV, Q_H, (const uint8_t *)L->dn_ab);
     float *abm = e->dn_ab, *g = e->dn_g, *beta = e->dn_beta;
-    lin_mm(e, &abl, xin, Q_H, n, abm, 2 * Q_DN_NV);
+    const lin *W[3] = {&L->dn_qkv, &L->dn_z, &abl};
+    float *Y[3] = {qkv, z, abm};
+    const int ldy[3] = {Q_DN_CONV, Q_DN_VAL, 2 * Q_DN_NV};
+    lin_mm_group(e, W, Y, ldy, 3, xin, Q_H, n);
     dn_job j = {e, L, li, n, qkv, cv, abm, g, beta, o, z};
     tp_for(e->tp, (int64_t)n * Q_DN_NK, 1, dn_prep_task, &j);
     tp_for(e->tp, Q_DN_NV, 1, dn_scan_task, &j);
@@ -665,9 +787,10 @@ static void qsa_block(inz_engine *e, const q_layer *L, int ai, int n, int p0, co
     float *qg = e->big;                         // [n][12288]: per head q (256) | gate (256)
     float *kv = e->tmp;                         // [n][1024]: k | v
     float *idx = e->tmp2;                       // [n][640]: 4 index query heads | index key
-    lin_mm(e, &L->at_q, xin, Q_H, n, qg, Q_QPROJ);
-    lin_mm_after(e, &L->at_kv, &L->at_q, xin, Q_H, n, kv, 2 * Q_KV);
-    lin_mm_after(e, &L->at_idx, &L->at_kv, xin, Q_H, n, idx, Q_IDX_PROJ);
+    const lin *W[3] = {&L->at_q, &L->at_kv, &L->at_idx};
+    float *Y[3] = {qg, kv, idx};
+    const int ldy[3] = {Q_QPROJ, 2 * Q_KV, Q_IDX_PROJ};
+    lin_mm_group(e, W, Y, ldy, 3, xin, Q_H, n);
     float *q = e->Xn;                           // [n][24][256] (Xn is free inside a block)
     float *gate = e->Xn + (size_t)Q_MAX_T * Q_NH * Q_HD;
     float *iq = e->y;                           // [n][4][128] (y is written only by o_proj, at the end)
@@ -753,7 +876,7 @@ static void expert_compute(inz_engine *e, const uint8_t *blob, const unit *u, co
 }
 
 /* Decode / verify (n <= 8 tokens): the resident experts of a layer are computed together, in three dispatches over
- * (expert, 16-row chunk) items, instead of two small dispatches per expert. Per row the arithmetic is the same as
+ * (expert, 64-row chunk) items, instead of two small dispatches per expert. Per row the arithmetic is the same as
  * expert_compute's, so the results are identical. */
 #define EB_MAX 80                                // experts x tokens of one batch (10 experts x 8 tokens)
 typedef struct {
@@ -764,16 +887,29 @@ typedef struct {
     float *D;                                    // [ntok][H]
 } ebatch_item;
 
-typedef struct { inz_engine *e; ebatch_item *it; int ni; const float *xin; } ebatch_job;
+typedef struct {
+    inz_engine *e;
+    ebatch_item *it;
+    int ni;
+    const float *xin;
+    int nq, sl;                                  // slices of the tokens' inputs quantized by the gate|up dispatch
+    atomic_int qleft;
+} ebatch_job;
 
-#define EB_CHUNK 16
+#define EB_CHUNK 64  // rows per call: the kernels prefetch the next rows within a call
 static void eb_gu_task(void *ctx, int64_t b, int64_t e_, int tid) {
     (void)tid;
     ebatch_job *j = ctx;
     const int per = 2 * Q_FF / EB_CHUNK;
     for (int64_t k = b; k < e_; k++) {
-        ebatch_item *it = &j->it[k / per];
-        const int r0 = (int)(k % per) * EB_CHUNK, r1 = r0 + EB_CHUNK;
+        if (k < j->nq) {                         // the tokens' inputs first, in slices, as in mmg_task
+            mmg_quantize(j->e->eb_xa, j->xin, Q_H, j->sl, Q_H / j->sl, (int)k);
+            atomic_fetch_sub_explicit(&j->qleft, 1, memory_order_release);
+            continue;
+        }
+        while (atomic_load_explicit(&j->qleft, memory_order_acquire) > 0) _mm_pause();
+        ebatch_item *it = &j->it[(k - j->nq) / per];
+        const int r0 = (int)((k - j->nq) % per) * EB_CHUNK, r1 = r0 + EB_CHUNK;
         if (it->u->ntok == 1) inz_matvec_rows(&it->gu.q, it->ga, it->GU, r0, r1);
         else inz_matmul_rows(&it->gu.q, it->ga, it->u->ntok, it->GU, 2 * Q_FF, r0, r1);
     }
@@ -811,11 +947,11 @@ static void eb_down_task(void *ctx, int64_t b, int64_t e_, int tid) {
 }
 
 // compute the given units (blobs pinned) as one batch; quantized expert types only. The tokens' MoE inputs are
-// quantized once for the gate|up rotation, which all experts of a layer share; an expert with another rotation
-// (not produced by the converter) is computed on its own.
+// quantized once for the gate|up rotation, which all experts of a layer share, by the gate|up dispatch; an expert
+// with another rotation (not produced by the converter) is computed on its own.
 static void experts_batch(inz_engine *e, const unit *const *us, const uint8_t *const *blobs, int nb, int n, const float *xin) {
     ebatch_item *it = e->eb_items;
-    int ni = 0, rows = 0, qrot = -1;
+    int ni = 0, rows = 0, qrot = -1, sl = 0;
     uint32_t qseed = 0;
     for (int i = 0; i < nb; i++) {
         ebatch_item *x = &it[ni];
@@ -825,7 +961,11 @@ static void experts_batch(inz_engine *e, const unit *const *us, const uint8_t *c
         if (qrot < 0) {
             qrot = x->gu.q.rot_block;
             qseed = x->gu.q.rot_seed;
-            for (int t = 0; t < n; t++) inz_act_quantize(&e->eb_xa[t], xin + (size_t)t * Q_H, Q_H, qrot, qseed);
+            sl = mmg_slice(Q_H, qrot);
+            for (int t = 0; t < n; t++) {
+                if (sl) inz_act_begin(&e->eb_xa[t], Q_H, qrot, qseed);
+                else inz_act_quantize(&e->eb_xa[t], xin + (size_t)t * Q_H, Q_H, qrot, qseed);
+            }
         } else if (x->gu.q.rot_block != qrot || x->gu.q.rot_seed != qseed) {
             expert_compute(e, blobs[i], us[i], xin, e->moe_out);
             continue;
@@ -841,10 +981,11 @@ static void experts_batch(inz_engine *e, const unit *const *us, const uint8_t *c
         ni++;
     }
     if (!ni) return;
-    ebatch_job j = {e, it, ni, xin};
-    tp_for(e->tp, (int64_t)ni * (2 * Q_FF / EB_CHUNK), 4, eb_gu_task, &j);
+    ebatch_job j = {.e = e, .it = it, .ni = ni, .xin = xin, .nq = sl ? n * (Q_H / sl) : 0, .sl = sl};
+    atomic_init(&j.qleft, j.nq);
+    tp_for(e->tp, j.nq + (int64_t)ni * (2 * Q_FF / EB_CHUNK), 1, eb_gu_task, &j);
     tp_for(e->tp, ni, 1, eb_act_task, &j);
-    tp_for(e->tp, (int64_t)ni * (Q_H / EB_CHUNK), 8, eb_down_task, &j);
+    tp_for(e->tp, (int64_t)ni * (Q_H / EB_CHUNK), 2, eb_down_task, &j);
 }
 
 // l: expert cache layer (0..47, n_layer for the MTP layer)
@@ -897,11 +1038,19 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
     if (n <= 8)
         for (int i = 0; i < nu; i++)
             if (!ec_is_resident(e->ec, l, units[i].expert)) { ec_request(e->ec, l, units[i].expert, 1.0f, EC_FULL); asked[i] = true; }
-    if (n <= 8 && e->opt.lookahead > 0 && l + 1 < e->n_layer && !e->ec_all_resident) {
-        // the residual drifts slowly: this layer's MoE input through the next layer's router predicts its experts
+    // Compute the shared expert while the requested experts are arriving. Its gate|up runs in one dispatch with the
+    // lookahead: the residual drifts slowly, so this layer's MoE input through the next layer's router predicts
+    // the next layer's experts.
+    const bool look = n <= 8 && e->opt.lookahead > 0 && l + 1 < e->n_layer && !e->ec_all_resident;
+    t0 = diag_tsc();
+    float *GU = e->big, *D = e->tmp2, *lg2 = e->tmp + (size_t)n * Q_N_EXPERT;
+    const lin *W[2] = {&L->sh_gu, look ? &e->L[l + 1].router : NULL};
+    float *Y[2] = {GU, lg2};
+    const int ldy[2] = {2 * Q_SHARED_FF, Q_N_EXPERT};
+    lin_mm_group(e, W, Y, ldy, look ? 2 : 1, xin, Q_H, n);
+    diag_add(DG_SHARED, l, t0, q_lin_bytes(&L->sh_gu) + (look ? q_lin_bytes(&e->L[l + 1].router) : 0), 0);
+    if (look) {
         const uint64_t tl = diag_tsc();
-        float *lg2 = e->tmp + (size_t)n * Q_N_EXPERT;
-        lin_mm(e, &e->L[l + 1].router, xin, Q_H, n, lg2, Q_N_EXPERT);
         for (int t = 0; t < n; t++) {
             const float *lg = lg2 + (size_t)t * Q_N_EXPERT;
             int32_t ps[Q_TOPK];
@@ -909,18 +1058,15 @@ static void moe_block(inz_engine *e, const q_layer *L, int l, int n, const float
             for (int k = 0; k < Q_TOPK; k++) ec_prefetch(e->ec, l + 1, ps[k], 0.5f, EC_FULL);
             if (n == 1) { memcpy(e->pred[l + 1], ps, sizeof(ps)); e->pred_valid[l + 1] = true; g_diag.pred_total += Q_TOPK; }
         }
-        diag_add(DG_PREFETCH, l, tl, q_lin_bytes(&e->L[l + 1].router), 0);
+        diag_add(DG_PREFETCH, l, tl, 0, 0);
     }
-    // Compute the shared expert while the requested experts are arriving.
     t0 = diag_tsc();
-    float *GU = e->big, *D = e->tmp2;
-    lin_mm(e, &L->sh_gu, xin, Q_H, n, GU, 2 * Q_SHARED_FF);
     for (int t = 0; t < n; t++) {
         float *r = GU + (size_t)t * 2 * Q_SHARED_FF;
         for (int c = 0; c < Q_SHARED_FF; c++) r[c] = siluf(r[c]) * r[Q_SHARED_FF + c];
     }
     lin_mm(e, &L->sh_down, GU, 2 * Q_SHARED_FF, n, D, Q_H);
-    diag_add(DG_SHARED, l, t0, q_lin_bytes(&L->sh_gu) + q_lin_bytes(&L->sh_down), 0);
+    diag_add(DG_SHARED, l, t0, q_lin_bytes(&L->sh_down), 0);
     t0 = diag_tsc();
     const bool batch = n <= 8 && nu <= EB_MAX && !e->imx_exp && e->expert_type != INZ_T_F16 && e->expert_type != INZ_T_F32;
     const unit *bu[EB_MAX];

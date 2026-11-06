@@ -12,6 +12,7 @@
 /tests/test_threadpool
 /tests/test_forward
 /tests/test_tokenizer
+/tests/bench_matvec
 /tools/bench_q38
 /tools/cachesim
 /tools/hwprobe

@@ -30,7 +30,9 @@ Weights are stored in groups of 64. In the quantized formats, each group shares 
 
 ## Why decoding is cheap
 
-The table of levels is so small that the CPU looks up 32 weights with a single instruction, and multiplies them by the layer's input with another (the AVX-VNNI instructions of recent x86 CPUs). Turning a 4-bit weight back into a number therefore costs almost nothing: the speed is set by how fast memory delivers the bytes. On the reference laptop, the 4-bit kernel reads weights at 74 GB/s, close to the RAM's peak of 77 GB/s.
+The table of levels is so small that the CPU looks up 32 weights with a single instruction, and multiplies them by the layer's input with another (the AVX-VNNI instructions of recent x86 CPUs). Turning a 4-bit weight back into a number therefore costs almost nothing: the speed is set by how fast memory delivers the bytes. On the reference laptop, the 4-bit kernel reads weights at 74 to 77 GB/s, the RAM's peak.
+
+**Prefetch.** The hardware prefetcher follows a stream only once it has seen a few of its lines. The 4-bit kernel reads two rows at a time, so every row pair would start two new streams. Every kernel that decoding uses (Q4L, Q8G, F16 and F32, for one token or a few) therefore prefetches the next rows while it computes the current ones; no result changes. On rows of 2560 weights, the width of most of the model's matrices and of the experts' gate|up projection, Q4L went from 57 to 74 GB/s, Q8G from 70 to 78 GB/s and F16 from 66 to 74 GB/s. The experts' down rows (640 weights) went from 59 to 65 GB/s. Together with one dispatch per input ([ARCHITECTURE.md](ARCHITECTURE.md#threading)), this made decoding 12% faster (8.7 to 9.8 tokens/s), and 9% faster with MTP (11.0 to 12.0), on the same answers.
 
 ## The LM head in two stages
 

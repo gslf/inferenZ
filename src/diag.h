@@ -21,7 +21,7 @@ typedef enum {
     DG_ATTN_OUT,        // o_proj
     DG_FFN_NORM,
     DG_ROUTER,
-    DG_PREFETCH,        // router lookahead + io submission
+    DG_PREFETCH,        // router lookahead (its matvec counts in DG_SHARED) + io submission
     DG_EXPERT_HIT,      // routed experts computed from RAM
     DG_EXPERT_WAIT,     // stalled on SSD
     DG_EXPERT_MISS,     // routed experts computed after arrival

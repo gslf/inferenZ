@@ -59,7 +59,10 @@ tests/test_forward: tests/test_forward.c src/model_fwd.c src/quant.c src/threadp
 tests/test_tokenizer: tests/test_tokenizer.c src/tokenizer.c src/json.c src/util.c
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+tests/bench_matvec: tests/bench_matvec.c src/quant.c src/threadpool.c src/util.c
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
 clean:
-	rm -rf build inz tests/test_quant tests/test_tokenizer tests/test_chat tests/test_chat_parse tests/test_forward tests/test_kernels tests/test_kernels_avx2 tests/test_threadpool tools/hwprobe
+	rm -rf build inz tests/test_quant tests/test_tokenizer tests/test_chat tests/test_chat_parse tests/test_forward tests/test_kernels tests/test_kernels_avx2 tests/test_threadpool tests/bench_matvec tools/hwprobe
 
 .PHONY: all test clean

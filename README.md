@@ -11,6 +11,8 @@ Qwen3.8-Flash-Next is a hybrid model:
 - a 51 GB hashed n-gram embedding;
 - an MTP layer for speculative decoding.
 
+On the reference laptop (Core Ultra 7 265U, 62 GB of RAM) it decodes 9.8 tokens/s, 12.0 with MTP speculative decoding (`inz bench --tokens 160`, warm expert cache, greedy).
+
 
 ## Quick start
 
@@ -60,7 +62,7 @@ The engine sizes its expert cache automatically and leaves max(10 GB, 30% of RAM
 
 ## References
 
-- **Recent improvements.** [Speed and reliability](docs/ANALISI-2026-10-25.md).
+- **Recent improvements.** [Speed and reliability](docs/ANALISI-2026-10-25.md). Decoding is 9-12% faster since the kernels prefetch the next rows and the matrices that share an input run as one dispatch ([QUANTIZATION.md](docs/QUANTIZATION.md#why-decoding-is-cheap), [ARCHITECTURE.md](docs/ARCHITECTURE.md#threading)).
 
 - **Architecture overview.** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Diagnostics.** [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)

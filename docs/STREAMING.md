@@ -34,8 +34,8 @@ For each MoE layer of a decode step:
 
 1. **Route** (softmax over 512, top-10, renormalized).
 2. **Issue demand reads** for the non-resident experts of this layer.
-3. **Router lookahead** (`--lookahead 1`, default). This layer's MoE input goes through the next layer's router. The predicted top-10 are queued as prefetches. It works because the residual stream changes slowly from layer to layer (Eliseev & Mazur 2023, SpecMD). The cost is one 512 × 2560 matvec per layer.
-4. **Compute the shared expert** while the reads are in flight.
+3. **Router lookahead** (`--lookahead 1`, default). This layer's MoE input goes through the next layer's router, in the same dispatch as the shared expert's gate|up projection, which reads the same input. The predicted top-10 are queued as prefetches. It works because the residual stream changes slowly from layer to layer (Eliseev & Mazur 2023, SpecMD). The cost is one 512 × 2560 matvec per layer.
+4. **Finish the shared expert** while the reads are in flight.
 5. **Compute available experts together**, including new arrivals, without waiting for every read.
 6. **Combine the results in a fixed order**, so arrival order does not change the answer.
 

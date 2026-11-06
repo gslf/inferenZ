@@ -64,6 +64,7 @@ The attention caches are positional. The DeltaNet state, its short convolutions 
 ## Threading
 
 `tp_for` hands out chunks of rows through an atomic cursor, so fast P-cores simply take more chunks than E-cores and there are no stragglers.
+- **One dispatch per input.** In decode and verify, the matrices that share an input run as one dispatch: q|k|v, z and a|b of a DeltaNet layer; q, k|v and the indexer of a QSA layer; the n-gram key and value; the shared expert's gate|up with the next layer's router. That dispatch also quantizes the input: its first chunks quantize slices of it in parallel, the others wait for them, then compute rows. The routed experts' input is quantized the same way, by the dispatch of their gate|up rows. A single thread quantizing alone would fetch, one by one, the cache lines the previous kernel's threads just wrote.
 - **Placement.** Workers are pinned, one per physical P or E core. SMT siblings and the low-power E-cores are left to the HTTP server and I/O completion.
 - **Idle waiting.** Idle workers wait with `UMONITOR/UMWAIT` (WAITPKG) before falling back to a futex. On a laptop this keeps the turbo budget for the cores doing work.
 
