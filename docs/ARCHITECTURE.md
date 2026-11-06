@@ -54,12 +54,13 @@ Every cache is positional, so the engine can rewind to any earlier position whos
 ## Threading
 
 `tp_for` hands out chunks of rows through an atomic cursor, so fast P-cores simply take more chunks than E-cores and there are no stragglers.
+- **One dispatch per input.** In decode, the matrices that share an input (q, k, v and the gate) run as one dispatch, and that dispatch also quantizes the input: its first chunks quantize slices of it in parallel, the others wait for them, then compute rows. A single thread quantizing alone would fetch, one by one, the cache lines the previous kernel's threads just wrote.
 - **Placement.** Workers are pinned, one per physical P or E core. SMT siblings and the low-power E-cores are left to the HTTP server and I/O completion.
 - **Idle waiting.** Idle workers wait with `UMONITOR/UMWAIT` (WAITPKG) before falling back to a futex. On a laptop this keeps the turbo budget for the cores doing work.
 
 ## Correctness strategy
 
-- **Reference.** `tests/ref_laguna.py` runs the official transformers implementation (`laguna`) on the official NVFP4 checkpoint, one layer at a time in float32. The routed experts are replaced by a lazy loader with the same math, so only the experts the router picks are loaded.
+- **Reference.** `tests/ref_laguna.py` runs the official transformers implementation (`laguna`) on the official NVFP4 checkpoint, one layer at a time in float32. The routed experts are replaced by a lazy loader with the same math, so only the experts the router picks are loaded. `--act int8` rounds the experts' inputs as the engine does, so the error of the activation format can be told from an error of the engine ([QUANTIZATION.md](QUANTIZATION.md#accuracy-of-the-whole-model)).
 - **Layer by layer.** `INZ_DUMP_HIDDEN=file inz dump` writes the engine's residual after every layer. `tests/compare_hidden.py` compares it with the reference's `--dump-hidden`. A bug shows up as a jump at the layer that has it.
 - **Logits.** `tests/compare_logits.py` gives KL, cosine, top-1 and top-5 agreement.
 - **Byte-exact parity tests:**
